@@ -1,6 +1,6 @@
 services:
   group-ai-bot:
-    build: .
+    image: ghcr.io/likhixang/group-ai-bot:latest
     container_name: group-ai-bot
     restart: unless-stopped
     # 改为 bridge + docker_share；AI_BASE_URL 改用容器名访问 axonhub-app
