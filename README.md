@@ -63,6 +63,7 @@ docker compose logs -f group-ai-bot
 - Reply to a bot-generated text message to continue the text context (no prefix needed)
 - Reply to a bot-generated image with edit instructions to modify that image
 - `edit your instructions` or `/edit your instructions` — edit the replied image; also works when uploading a photo with the edit instruction as caption
+- Reply to an image with `/av`, or send an image with `/av` as its caption — search AVScan for matching codes; after the global cleanup TTL, the source image, command, and result are all deleted
 - `/new` — clear your personal chat context
 - `/new_group` — clear the group chat memory (super-admin only)
 - `/pin content` — update the daily pinned message in the target topic (super-admin only)

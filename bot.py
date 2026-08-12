@@ -98,6 +98,9 @@ IMAGE_URL_FILE_RE = re.compile(
     r"^https?://\S+\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\?\S*)?$",
     re.IGNORECASE,
 )
+AVSCAN_COMMAND_RE = re.compile(
+    r"(?:^|\s)/av(?:@(?P<target>\w+))?(?=\s|$)", re.IGNORECASE
+)
 PIN_LAST_RUN_DATE: Optional[str] = None
 # 并发限制：最多 3 个请求同时处理
 _ACTIVE_DS = 0
@@ -117,6 +120,20 @@ EMOJI_RE = re.compile(
 AI_STREAM_TIMEOUT_RETRIES = 2
 IMAGE_GEN_TIMEOUT = 300
 IMAGE_GEN_RETRIES = 1
+
+# --- AVScan 图片检索 ---
+# AVScan 当前没有公开 API key / 文档；前端使用同源 POST /search 上传 `file`。
+# 这里默认走其 HTTPS 入口，并把 Telegram 原图统一转为与其前端一致的缩小 JPEG。
+AVSCAN_API_URL = (
+    os.getenv("AVSCAN_API_URL", "https://avscan.cc/search").strip()
+    or "https://avscan.cc/search"
+)
+AVSCAN_TIMEOUT = max(5, int(os.getenv("AVSCAN_TIMEOUT", "90")))
+AVSCAN_MAX_RESULTS = max(1, min(10, int(os.getenv("AVSCAN_MAX_RESULTS", "10"))))
+AVSCAN_MAX_SOURCE_BYTES = 20 * 1024 * 1024
+AVSCAN_MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+AVSCAN_MAX_IMAGE_PIXELS = 40_000_000
+AVSCAN_MAX_SIDE = 1024
 
 # --- 视频生成 (agnes-video-v2.0 异步任务 API) ---
 # 注意：创建任务可走 AxonHub，但取结果必须直连上游 —— AxonHub 会剥掉响应里的
@@ -1221,6 +1238,39 @@ def _reply_image_target(msg) -> Optional[str]:
     if not _is_reply_to_this_bot(msg):
         return None
     return _message_image_target(getattr(msg, "reply_to_message", None))
+
+
+def _avscan_reply_image_target(msg) -> Optional[str]:
+    """Return the replied image's file ID for /av.
+
+    Unlike image editing, AVScan intentionally accepts an image sent by any
+    chat member; the command itself must still be an explicit reply.
+    """
+    return _message_image_target(getattr(msg, "reply_to_message", None))
+
+
+def _is_avscan_request(raw_text: str) -> bool:
+    """Whether text/caption contains `/av` for this bot (or has no target)."""
+    match = AVSCAN_COMMAND_RE.search(raw_text or "")
+    if not match:
+        return False
+    target = match.group("target")
+    if not target:
+        return True
+    return bool(BOT_USERNAME and target.lower() == BOT_USERNAME.lower())
+
+
+def _avscan_image_source(msg):
+    """Return the image file ID and message that /av must delete afterward.
+
+    A photo/document carrying `/av` in its caption searches itself. A plain
+    `/av` command searches the image it replies to.
+    """
+    own_file_id = _message_image_target(msg)
+    if own_file_id:
+        return own_file_id, msg
+    replied = getattr(msg, "reply_to_message", None)
+    return _avscan_reply_image_target(msg), replied
 
 
 def _is_text_ai_prefix(raw_text: str) -> bool:
@@ -2669,10 +2719,142 @@ async def _download_video(url: str) -> bytes:
         return resp.content
 
 
-async def _download_telegram_file(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
+async def _download_telegram_file(
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    *,
+    max_bytes: Optional[int] = None,
+) -> bytes:
     tg_file = await context.bot.get_file(file_id)
+    declared_size = getattr(tg_file, "file_size", None)
+    if max_bytes is not None and isinstance(declared_size, int) and declared_size > max_bytes:
+        raise ValueError(f"图片文件过大，请发送不超过 {max_bytes // (1024 * 1024)}MB 的图片。")
     data = await tg_file.download_as_bytearray()
-    return bytes(data)
+    output = bytes(data)
+    if max_bytes is not None and len(output) > max_bytes:
+        raise ValueError(f"图片文件过大，请发送不超过 {max_bytes // (1024 * 1024)}MB 的图片。")
+    return output
+
+
+class AVScanError(RuntimeError):
+    """A safe, user-facing failure from the external AVScan service."""
+
+
+class AVScanRateLimitedError(AVScanError):
+    """AVScan temporarily refused the request due to rate limiting."""
+
+
+def _prepare_avscan_image(image_bytes: bytes) -> bytes:
+    """Validate and reduce a Telegram image before sending it to AVScan.
+
+    The AVScan browser client itself submits a JPEG capped at 1024 pixels on
+    its longest side. Matching that behavior keeps payloads under its 8 MB
+    limit and avoids sending a full-resolution source image unnecessarily.
+    """
+    if not image_bytes:
+        raise ValueError("图片为空，无法检索。")
+    if len(image_bytes) > AVSCAN_MAX_SOURCE_BYTES:
+        raise ValueError("图片文件过大，请发送不超过 20MB 的图片。")
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as source:
+            width, height = source.size
+            if width < 1 or height < 1:
+                raise ValueError("图片尺寸无效。")
+            if width * height > AVSCAN_MAX_IMAGE_PIXELS:
+                raise ValueError("图片分辨率过大，请发送较小的截图。")
+            source.thumbnail(
+                (AVSCAN_MAX_SIDE, AVSCAN_MAX_SIDE), Image.Resampling.LANCZOS
+            )
+            # Convert after shrinking, not before: a large original screenshot
+            # should never make the bot retain a full-resolution RGB copy.
+            if source.mode in {"RGBA", "LA"} or "transparency" in source.info:
+                rgba = source.convert("RGBA")
+                prepared = Image.new("RGB", rgba.size, "white")
+                prepared.paste(rgba, mask=rgba.getchannel("A"))
+            else:
+                prepared = source.convert("RGB")
+            output = BytesIO()
+            prepared.save(output, format="JPEG", quality=85, optimize=True)
+    except ValueError:
+        raise
+    except (OSError, Image.DecompressionBombError) as exc:
+        raise ValueError("无法读取这张图片，请换一张 JPG、PNG 或 WEBP 截图。") from exc
+
+    prepared_bytes = output.getvalue()
+    if len(prepared_bytes) > AVSCAN_MAX_UPLOAD_BYTES:
+        raise ValueError("处理后的图片仍超过 8MB，请先裁剪或压缩后重试。")
+    return prepared_bytes
+
+
+async def _search_avscan(image_bytes: bytes) -> dict:
+    """Upload a prepared JPEG to AVScan's observed browser endpoint."""
+    timeout = httpx.Timeout(connect=15, read=AVSCAN_TIMEOUT, write=30, pool=15)
+    files = {"file": ("frame.jpg", image_bytes, "image/jpeg")}
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.post(AVSCAN_API_URL, files=files)
+
+    if response.status_code == 429:
+        raise AVScanRateLimitedError("AVScan 请求过于频繁")
+    if response.status_code >= 400:
+        raise AVScanError(f"AVScan HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise AVScanError("AVScan 返回了无效响应") from exc
+    if not isinstance(payload, dict):
+        raise AVScanError("AVScan 返回了无效响应")
+    return payload
+
+
+def _avscan_number(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number:  # NaN
+        return 0.0
+    return max(0.0, min(100.0, number))
+
+
+def _avscan_timestamp(image_name) -> str:
+    """Turn AVScan's `CODE_01-02-03.jpg` frame name into `01:02:03`."""
+    base = str(image_name or "").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    _prefix, sep, timestamp = base.rpartition("_")
+    if not sep or not re.fullmatch(r"\d{2}-\d{2}-\d{2}", timestamp):
+        return "--:--:--"
+    return timestamp.replace("-", ":")
+
+
+def _format_avscan_results(payload: dict, max_results: int = AVSCAN_MAX_RESULTS) -> str:
+    """Render the compact, untrusted AVScan JSON response as Telegram HTML."""
+    raw_results = payload.get("results") if isinstance(payload, dict) else None
+    results = [item for item in raw_results if isinstance(item, dict)] if isinstance(raw_results, list) else []
+    if not results:
+        return "🔎 <b>AVScan 检索结果</b>\n没有找到可用匹配。换一张更清晰、少水印的截图再试试。"
+
+    limit = max(1, min(10, int(max_results)))
+    lines = [
+        "🔎 <b>AVScan 检索结果</b>",
+        "相似度低于 85% 时仅供参考。",
+    ]
+    for index, item in enumerate(results[:limit], start=1):
+        code = escape(str(item.get("video_code") or "未知番号")[:48])
+        similarity = _avscan_number(item.get("best_similarity"))
+        raw_frames = item.get("frames")
+        frames = [frame for frame in raw_frames if isinstance(frame, dict)] if isinstance(raw_frames, list) else []
+        best_frame = max(
+            frames,
+            key=lambda frame: _avscan_number(frame.get("similarity")),
+            default=None,
+        )
+        timestamp = escape(_avscan_timestamp(
+            best_frame.get("image_name") if best_frame else None
+        ))
+        lines.append(
+            f"{index}. <code>{code}</code> — <b>{similarity:.1f}%</b> · {timestamp}"
+        )
+    return "\n".join(lines)
 
 
 def _photo_file(image_bytes: bytes) -> BytesIO:
@@ -2692,6 +2874,24 @@ async def _delete_messages_later(
         except Exception:
             # Ignore already deleted / too old / insufficient rights.
             pass
+
+
+def _schedule_avscan_cleanup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, *messages) -> None:
+    """Delete AVScan source, command, and response on the global TTL."""
+    message_ids = []
+    for message in messages:
+        message_id = getattr(message, "message_id", None)
+        if isinstance(message_id, int) and message_id not in message_ids:
+            message_ids.append(message_id)
+    if message_ids:
+        context.application.create_task(
+            _delete_messages_later(
+                context,
+                chat_id,
+                message_ids,
+                NOTICE_DELETE_TTL,
+            )
+        )
 
 
 async def _reply_not_allowed_and_cleanup(
@@ -2743,7 +2943,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
     await _reply_text_and_track(
         msg,
-        "已上线。发送：ds / gk + 空格 + 问题；img + 提示词生成图片；回复图片用 edit + 要求改图。"
+        "已上线。发送：ds / gk + 空格 + 问题；img + 提示词生成图片；回复图片用 edit + 要求改图；回复图片发 /av，或图片 caption 写 /av 可检索番号。"
     )
 
 
@@ -2767,6 +2967,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"/gk 或 gk 你的问题 — 对话 ({GROK_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
             "/edit 或 edit 要求 — 回复图片改图（或上传图+写 caption）\n"
+            "/av — 回复图片，或图片 caption 写 /av 检索番号（AVScan）\n"
             "/vid 或 vid 描述 — 生成视频（约 3 秒，要等 1-2 分钟）\n"
             "  回复图片或上传图片写 /vid 描述 — 图生视频\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
@@ -3486,12 +3687,94 @@ async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await on_image_request(update, context)
 
 
+async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search a captioned or replied image through AVScan."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    # The generic image-caption path may see `/av@other_bot`, too. Ignore it;
+    # normal CommandHandler dispatch already limits text commands to this bot.
+    if getattr(msg, "caption", None) and not _is_avscan_request(_message_prompt_text(msg)):
+        return
+
+    file_id, source_message = _avscan_image_source(msg)
+
+    uid = msg.from_user.id if msg.from_user else None
+    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}:
+        if not _is_private_super_admin(chat, uid):
+            return
+    if not _is_private_super_admin(chat, uid):
+        if not _is_allowed_chat(chat) or not _is_allowed_topic(msg):
+            warning = await _reply_text_and_track(msg, _not_allowed_usage_text())
+            _schedule_avscan_cleanup(context, chat.id, source_message, msg, warning)
+            return
+
+    if not file_id:
+        await _reply_and_cleanup(
+            msg,
+            context,
+            "用法：<b>回复一张图片</b>后发送 <code>/av</code>，或发送图片时在 caption 写 <code>/av</code>。",
+            NOTICE_DELETE_TTL,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        status = await _reply_text_and_track(msg, "🔎 AVScan 检索中...")
+    except Exception:
+        logger.exception("avscan status reply failed: chat=%s msg=%s", chat.id, msg.message_id)
+        _schedule_avscan_cleanup(context, chat.id, source_message, msg)
+        return
+    try:
+        source_bytes = await _download_telegram_file(
+            context,
+            file_id,
+            max_bytes=AVSCAN_MAX_SOURCE_BYTES,
+        )
+        upload_bytes = _prepare_avscan_image(source_bytes)
+        payload = await _search_avscan(upload_bytes)
+        result_text = _format_avscan_results(payload)
+        await status.edit_text(
+            result_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        raw_results = payload.get("results")
+        result_count = len(raw_results) if isinstance(raw_results, list) else 0
+        logger.info(
+            "avscan_response_complete: chat=%s msg=%s results=%s upload_bytes=%s",
+            chat.id,
+            msg.message_id,
+            result_count,
+            len(upload_bytes),
+        )
+    except ValueError as exc:
+        logger.info("avscan invalid image: chat=%s msg=%s reason=%s", chat.id, msg.message_id, exc)
+        await status.edit_text(f"❌ {escape(str(exc))}", parse_mode=ParseMode.HTML)
+    except AVScanRateLimitedError:
+        logger.warning("avscan rate limited: chat=%s msg=%s", chat.id, msg.message_id)
+        await status.edit_text("⏳ AVScan 当前请求过多，请稍后再试。")
+    except Exception:
+        logger.exception("avscan request failed: chat=%s msg=%s", chat.id, msg.message_id)
+        await status.edit_text("❌ AVScan 服务暂时不可用，请稍后再试。")
+    finally:
+        # AVScan queries may expose sensitive media. Honor the bot-wide cleanup
+        # TTL for all three items: source image, command/caption, and response.
+        _schedule_avscan_cleanup(context, chat.id, source_message, msg, status)
+
+
 async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
         return
 
+    # CommandHandler only recognizes message.text. Caption commands need to be
+    # caught here, so `/av` works both as a photo caption and as a reply.
+    if _is_avscan_request(_message_prompt_text(msg)):
+        await av_cmd(update, context)
+        return
     # /vid 分流：PTB 的 CommandHandler 只认 message.text，图片 caption 里的
     # /vid 不会触发 video_cmd，所以在这里接住转过去。
     if _is_video_request(_message_prompt_text(msg)):
@@ -5174,6 +5457,7 @@ async def post_init(application: Application) -> None:
         BotCommand("gk", f"对话 ({GROK_MODEL})"),
         BotCommand("img", "生成图片"),
         BotCommand("edit", "修改图片"),
+        BotCommand("av", "回复图片或图片 caption 检索番号（AVScan）"),
         BotCommand("vid", "生成视频"),
         BotCommand("help", "查看帮助"),
         BotCommand("new", "清空你在当前聊天的记忆"),
@@ -5253,6 +5537,7 @@ def main() -> None:
     app.add_handler(CommandHandler("pin", pin_cmd))
     app.add_handler(CommandHandler("unpin", unpin_cmd))
     app.add_handler(CommandHandler(["img", "edit"], image_cmd))
+    app.add_handler(CommandHandler("av", av_cmd))
     app.add_handler(CommandHandler("vid", video_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("allow", allow_cmd))
