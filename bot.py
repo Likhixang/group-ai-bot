@@ -5408,10 +5408,13 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         # 按丢包率→平均延迟排序，取前5
+        def _num(v, default):
+            return default if v is None else v
+
         def _sort_key(r):
             stats = (r.get("result") or {}).get("stats") or {}
-            loss = stats.get("loss", 100)
-            avg = stats.get("avg", 9999)
+            loss = _num(stats.get("loss"), 100)
+            avg = _num(stats.get("avg"), 9999)
             return (loss, avg)
 
         sorted_results = sorted(results, key=_sort_key)
@@ -5435,14 +5438,14 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             resolved = res.get("resolvedAddress", "")
             timings = res.get("timings") or []
             rtt_list = [t["rtt"] for t in timings if isinstance(t, dict) and "rtt" in t]
-            loss = stats.get("loss", 100)
+            loss = _num(stats.get("loss"), 100)
             status = res.get("status", "unknown")
 
             if status == "finished" and loss < 100 and rtt_list:
                 rtt_str = ", ".join(f"{r:.1f}" for r in rtt_list)
-                min_ms = stats.get("min", 0)
-                avg_ms = stats.get("avg", 0)
-                max_ms = stats.get("max", 0)
+                min_ms = _num(stats.get("min"), 0)
+                avg_ms = _num(stats.get("avg"), 0)
+                max_ms = _num(stats.get("max"), 0)
                 icon = "🟢" if avg_ms < 100 else "🟡" if avg_ms < 300 else "🔴"
                 lines.append(
                     f"\n{icon} **{location}**"
