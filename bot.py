@@ -42,6 +42,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("group-ai-bot")
+# HTTPX logs complete request URLs at INFO. Suppress them so `/av <番号>`
+# inputs are not copied into persistent container logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -101,6 +104,13 @@ IMAGE_URL_FILE_RE = re.compile(
 AVSCAN_COMMAND_RE = re.compile(
     r"(?:^|\s)/av(?:@(?P<target>\w+))?(?=\s|$)", re.IGNORECASE
 )
+AV_TEXT_COMMAND_RE = re.compile(
+    r"^/av(?:@(?P<target>\w+))?(?:\s+(?P<argument>.+?))?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+AV_COVER_CODE_RE = re.compile(
+    r"^(?=.{3,48}$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+){0,3}$"
+)
 PIN_LAST_RUN_DATE: Optional[str] = None
 # 并发限制：最多 3 个请求同时处理
 _ACTIVE_DS = 0
@@ -134,6 +144,19 @@ AVSCAN_MAX_SOURCE_BYTES = 20 * 1024 * 1024
 AVSCAN_MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 AVSCAN_MAX_IMAGE_PIXELS = 40_000_000
 AVSCAN_MAX_SIDE = 1024
+
+# --- 番号封面查询（R18.dev JSON → DMM jacket）---
+# R18.dev 的 DVD ID JSON 返回 DMM jacket URL；每次命令只请求一次。
+R18DEV_LOOKUP_URL = "https://r18.dev/videos/vod/movies/detail/-/dvd_id={dvd_id}/json"
+R18DEV_TIMEOUT = max(5, int(os.getenv("R18DEV_TIMEOUT", "30")))
+R18DEV_MAX_JSON_BYTES = 1 * 1024 * 1024
+R18DEV_MAX_COVER_BYTES = 8 * 1024 * 1024
+R18DEV_MAX_COVER_PIXELS = 40_000_000
+R18DEV_COVER_HOST = "pics.dmm.co.jp"
+R18DEV_USER_AGENT = (
+    "group-ai-bot/1.0 "
+    "(single cover lookup; https://github.com/Likhixang/group-ai-bot)"
+)
 
 # --- 视频生成 (agnes-video-v2.0 异步任务 API) ---
 # 注意：创建任务可走 AxonHub，但取结果必须直连上游 —— AxonHub 会剥掉响应里的
@@ -1258,6 +1281,24 @@ def _is_avscan_request(raw_text: str) -> bool:
     if not target:
         return True
     return bool(BOT_USERNAME and target.lower() == BOT_USERNAME.lower())
+
+
+def _av_cover_argument(msg) -> tuple[bool, Optional[str]]:
+    """Return whether a text `/av` has an argument and its raw value.
+
+    This accepts an exact text command or an exact image caption command. A
+    plain `/av` image caption stays on the existing AVScan path; a command with
+    an argument selects the R18.dev cover lookup before any image is read.
+    """
+    text = _message_prompt_text(msg)
+    match = AV_TEXT_COMMAND_RE.fullmatch(text)
+    if not match:
+        return False, None
+    target = match.group("target")
+    if target and (not BOT_USERNAME or target.lower() != BOT_USERNAME.lower()):
+        return False, None
+    argument = match.group("argument")
+    return (argument is not None), (argument.strip() if argument else None)
 
 
 def _avscan_image_source(msg):
@@ -2807,6 +2848,157 @@ async def _search_avscan(image_bytes: bytes) -> dict:
     return payload
 
 
+class R18DevError(RuntimeError):
+    """A safe, user-facing failure from the R18.dev cover lookup."""
+
+
+class R18DevNotFoundError(R18DevError):
+    """R18.dev has no usable jacket for the requested DVD ID."""
+
+
+class R18DevRateLimitedError(R18DevError):
+    """R18.dev temporarily refused the lookup due to rate limiting."""
+
+
+def _normalize_av_cover_code(raw_code: str) -> Optional[str]:
+    """Return a safe R18.dev DVD ID, or None when `/av` has no valid code."""
+    code = (raw_code or "").strip().upper()
+    if not AV_COVER_CODE_RE.fullmatch(code):
+        return None
+    compact = code.replace("-", "").replace("_", "")
+    return compact if 3 <= len(compact) <= 48 else None
+
+
+async def _read_limited_http_body(response: httpx.Response, max_bytes: int) -> bytes:
+    """Read a streamed response without allowing an unexpected large body."""
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                raise R18DevError("response body is too large")
+        except ValueError:
+            pass
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk)
+        if len(body) > max_bytes:
+            raise R18DevError("response body is too large")
+    return bytes(body)
+
+
+def _validate_r18dev_cover_url(cover_url: str) -> str:
+    """Accept only the expected direct DMM jacket URL shape."""
+    if not isinstance(cover_url, str) or not cover_url:
+        raise R18DevError("R18.dev returned an invalid jacket URL")
+    try:
+        parsed = urllib.parse.urlsplit(cover_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise R18DevError("R18.dev returned an invalid jacket URL") from exc
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() != R18DEV_COVER_HOST
+        or parsed.username
+        or parsed.password
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/digital/video/")
+        or not parsed.path.lower().endswith(".jpg")
+    ):
+        raise R18DevError("R18.dev returned an unexpected jacket URL")
+    return cover_url
+
+
+def _r18dev_cover_from_payload(payload: dict) -> tuple[str, str]:
+    """Extract a strictly allow-listed DMM jacket URL from R18.dev JSON."""
+    images = payload.get("images") if isinstance(payload, dict) else None
+    jacket = images.get("jacket_image") if isinstance(images, dict) else None
+    cover_url = jacket.get("large2") if isinstance(jacket, dict) else None
+    if not isinstance(cover_url, str) or not cover_url:
+        raise R18DevNotFoundError("R18.dev returned no jacket")
+    cover_url = _validate_r18dev_cover_url(cover_url)
+
+    title = payload.get("title")
+    return ((title.strip()[:800] if isinstance(title, str) else ""), cover_url)
+
+
+async def _lookup_r18dev_cover(dvd_id: str) -> tuple[str, str]:
+    """Look up one DVD ID and return its title plus trusted DMM cover URL."""
+    lookup_url = R18DEV_LOOKUP_URL.format(
+        dvd_id=urllib.parse.quote(dvd_id, safe="")
+    )
+    timeout = httpx.Timeout(connect=10, read=R18DEV_TIMEOUT, write=15, pool=10)
+    headers = {"Accept": "application/json", "User-Agent": R18DEV_USER_AGENT}
+    # Direct HTTPS only: do not inherit any environment proxy settings.
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=False, trust_env=False
+    ) as client:
+        async with client.stream("GET", lookup_url, headers=headers) as response:
+            if 300 <= response.status_code < 400:
+                raise R18DevError(f"R18.dev unexpected redirect {response.status_code}")
+            if response.status_code == 404:
+                raise R18DevNotFoundError("R18.dev returned 404")
+            if response.status_code == 429:
+                raise R18DevRateLimitedError("R18.dev rate limited the lookup")
+            if response.status_code >= 400:
+                raise R18DevError(f"R18.dev HTTP {response.status_code}")
+            if "json" not in response.headers.get("content-type", "").lower():
+                raise R18DevError("R18.dev did not return JSON")
+            body = await _read_limited_http_body(response, R18DEV_MAX_JSON_BYTES)
+
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError) as exc:
+        raise R18DevError("R18.dev returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise R18DevError("R18.dev returned invalid JSON")
+    return _r18dev_cover_from_payload(payload)
+
+
+async def _download_r18dev_cover(cover_url: str) -> bytes:
+    """Download the allow-listed DMM jacket without following redirects."""
+    cover_url = _validate_r18dev_cover_url(cover_url)
+    timeout = httpx.Timeout(connect=10, read=R18DEV_TIMEOUT, write=15, pool=10)
+    headers = {"Accept": "image/jpeg", "User-Agent": R18DEV_USER_AGENT}
+    # The cover URL was allow-listed above; keep this direct as well.
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=False, trust_env=False
+    ) as client:
+        async with client.stream("GET", cover_url, headers=headers) as response:
+            if 300 <= response.status_code < 400:
+                raise R18DevError(f"DMM cover unexpected redirect {response.status_code}")
+            if response.status_code == 429:
+                raise R18DevRateLimitedError("DMM rate limited the cover download")
+            if response.status_code >= 400:
+                raise R18DevError(f"DMM cover HTTP {response.status_code}")
+            if not response.headers.get("content-type", "").lower().startswith("image/"):
+                raise R18DevError("DMM did not return an image")
+            body = await _read_limited_http_body(response, R18DEV_MAX_COVER_BYTES)
+
+    try:
+        with Image.open(BytesIO(body)) as cover:
+            width, height = cover.size
+            if width < 1 or height < 1 or width * height > R18DEV_MAX_COVER_PIXELS:
+                raise R18DevError("DMM returned an invalid cover size")
+            if cover.format != "JPEG":
+                raise R18DevError("DMM did not return a JPEG cover")
+            cover.verify()
+    except R18DevError:
+        raise
+    except (OSError, Image.DecompressionBombError) as exc:
+        raise R18DevError("DMM returned an invalid cover image") from exc
+    return body
+
+
+def _r18dev_cover_file(image_bytes: bytes) -> BytesIO:
+    bio = BytesIO(image_bytes)
+    bio.name = "cover.jpg"
+    bio.seek(0)
+    return bio
+
+
 def _avscan_number(value) -> float:
     try:
         number = float(value)
@@ -2876,8 +3068,8 @@ async def _delete_messages_later(
             pass
 
 
-def _schedule_avscan_cleanup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, *messages) -> None:
-    """Delete AVScan source, command, and response on the global TTL."""
+def _schedule_av_cleanup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, *messages) -> None:
+    """Delete AV lookup command, associated media, and response on the global TTL."""
     message_ids = []
     for message in messages:
         message_id = getattr(message, "message_id", None)
@@ -2943,7 +3135,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
     await _reply_text_and_track(
         msg,
-        "已上线。发送：ds / gk + 空格 + 问题；img + 提示词生成图片；回复图片用 edit + 要求改图；回复图片发 /av，或图片 caption 写 /av 可检索番号。"
+        "已上线。发送：ds / gk + 空格 + 问题；img + 提示词生成图片；回复图片用 edit + 要求改图；/av 番号查封面，回复图片发 /av 或图片 caption 写 /av 可检索番号。"
     )
 
 
@@ -2967,7 +3159,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"/gk 或 gk 你的问题 — 对话 ({GROK_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
             "/edit 或 edit 要求 — 回复图片改图（或上传图+写 caption）\n"
-            "/av — 回复图片，或图片 caption 写 /av 检索番号（AVScan）\n"
+            "/av 番号 — 查询 R18.dev 封面；回复图片发 /av，或图片 caption 写 /av 检索番号（AVScan）\n"
             "/vid 或 vid 描述 — 生成视频（约 3 秒，要等 1-2 分钟）\n"
             "  回复图片或上传图片写 /vid 描述 — 图生视频\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
@@ -3687,8 +3879,84 @@ async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await on_image_request(update, context)
 
 
+def _format_r18dev_cover_caption(dvd_id: str, title: str) -> str:
+    """Render bounded, escaped R18.dev metadata for Telegram HTML captions."""
+    compact_title = " ".join((title or "").split())[:120]
+    lines = [
+        "🖼 <b>R18.dev 封面</b>",
+        f"番号：<code>{escape(dvd_id)}</code>",
+    ]
+    if compact_title:
+        lines.append(escape(compact_title))
+    return "\n".join(lines)
+
+
+async def _av_cover_cmd(
+    msg, chat, context: ContextTypes.DEFAULT_TYPE, raw_cover_code: str
+) -> None:
+    """Fetch one R18.dev jacket for a validated `/av <番号>` command."""
+    dvd_id = _normalize_av_cover_code(raw_cover_code)
+    if not dvd_id:
+        await _reply_and_cleanup(
+            msg,
+            context,
+            "❌ 番号格式无效。用法：<code>/av ABP-001</code>。",
+            NOTICE_DELETE_TTL,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        status = await _reply_text_and_track(msg, "🖼 正在查询 R18.dev 封面...")
+    except Exception:
+        logger.exception("r18dev status reply failed: chat=%s msg=%s", chat.id, msg.message_id)
+        _schedule_av_cleanup(context, chat.id, msg)
+        return
+
+    cover_message = None
+    try:
+        title, cover_url = await _lookup_r18dev_cover(dvd_id)
+        image_bytes = await _download_r18dev_cover(cover_url)
+        cover_message = await msg.reply_photo(
+            photo=_r18dev_cover_file(image_bytes),
+            caption=_format_r18dev_cover_caption(dvd_id, title),
+            parse_mode=ParseMode.HTML,
+        )
+        logger.info(
+            "r18dev_cover_complete: chat=%s msg=%s cover_bytes=%s",
+            chat.id,
+            msg.message_id,
+            len(image_bytes),
+        )
+        try:
+            await context.bot.delete_message(
+                chat_id=status.chat_id, message_id=status.message_id
+            )
+        except Exception:
+            pass
+    except R18DevNotFoundError:
+        logger.info("r18dev cover not found: chat=%s msg=%s", chat.id, msg.message_id)
+        await status.edit_text("🔎 R18.dev 没有找到这个番号的可用封面。")
+    except R18DevRateLimitedError:
+        logger.warning("r18dev rate limited: chat=%s msg=%s", chat.id, msg.message_id)
+        await status.edit_text("⏳ R18.dev 当前请求过多，请稍后再试。")
+    except Exception as exc:
+        logger.warning(
+            "r18dev cover lookup failed: chat=%s msg=%s error=%s",
+            chat.id,
+            msg.message_id,
+            type(exc).__name__,
+        )
+        try:
+            await status.edit_text("❌ R18.dev 封面服务暂时不可用，请稍后再试。")
+        except Exception:
+            logger.exception("r18dev failure reply edit failed: chat=%s msg=%s", chat.id, msg.message_id)
+    finally:
+        _schedule_av_cleanup(context, chat.id, msg, status, cover_message)
+
+
 async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Search a captioned or replied image through AVScan."""
+    """Look up a DVD jacket by code, or search a replied/captioned image via AVScan."""
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
@@ -3698,7 +3966,12 @@ async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if getattr(msg, "caption", None) and not _is_avscan_request(_message_prompt_text(msg)):
         return
 
-    file_id, source_message = _avscan_image_source(msg)
+    has_cover_argument, raw_cover_code = _av_cover_argument(msg)
+    # A code lookup has no source image. In particular, do not delete an
+    # unrelated image merely because the `/av <番号>` command replies to it.
+    file_id, source_message = (None, None)
+    if not has_cover_argument:
+        file_id, source_message = _avscan_image_source(msg)
 
     uid = msg.from_user.id if msg.from_user else None
     if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}:
@@ -3707,14 +3980,22 @@ async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_private_super_admin(chat, uid):
         if not _is_allowed_chat(chat) or not _is_allowed_topic(msg):
             warning = await _reply_text_and_track(msg, _not_allowed_usage_text())
-            _schedule_avscan_cleanup(context, chat.id, source_message, msg, warning)
+            _schedule_av_cleanup(context, chat.id, source_message, msg, warning)
             return
+
+    if has_cover_argument:
+        await _av_cover_cmd(msg, chat, context, raw_cover_code or "")
+        return
 
     if not file_id:
         await _reply_and_cleanup(
             msg,
             context,
-            "用法：<b>回复一张图片</b>后发送 <code>/av</code>，或发送图片时在 caption 写 <code>/av</code>。",
+            (
+                "用法：<code>/av 番号</code> 查询 R18.dev 封面；"
+                "或<b>回复一张图片</b>后发送 <code>/av</code>，"
+                "或发送图片时在 caption 写 <code>/av</code>。"
+            ),
             NOTICE_DELETE_TTL,
             parse_mode=ParseMode.HTML,
         )
@@ -3724,7 +4005,7 @@ async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status = await _reply_text_and_track(msg, "🔎 AVScan 检索中...")
     except Exception:
         logger.exception("avscan status reply failed: chat=%s msg=%s", chat.id, msg.message_id)
-        _schedule_avscan_cleanup(context, chat.id, source_message, msg)
+        _schedule_av_cleanup(context, chat.id, source_message, msg)
         return
     try:
         source_bytes = await _download_telegram_file(
@@ -3761,7 +4042,7 @@ async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         # AVScan queries may expose sensitive media. Honor the bot-wide cleanup
         # TTL for all three items: source image, command/caption, and response.
-        _schedule_avscan_cleanup(context, chat.id, source_message, msg, status)
+        _schedule_av_cleanup(context, chat.id, source_message, msg, status)
 
 
 async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5457,7 +5738,7 @@ async def post_init(application: Application) -> None:
         BotCommand("gk", f"对话 ({GROK_MODEL})"),
         BotCommand("img", "生成图片"),
         BotCommand("edit", "修改图片"),
-        BotCommand("av", "回复图片或图片 caption 检索番号（AVScan）"),
+        BotCommand("av", "番号查 R18.dev 封面；图片检索 AVScan"),
         BotCommand("vid", "生成视频"),
         BotCommand("help", "查看帮助"),
         BotCommand("new", "清空你在当前聊天的记忆"),

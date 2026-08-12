@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import os
 import sys
@@ -71,6 +72,203 @@ def test_image_prompt_web_search_decision_for_current_or_specific_subjects():
     assert bot._should_web_search_image_prompt("img 画一张 iPhone 18 发布会海报") is True
     assert bot._should_web_search_image_prompt("img 画一只白猫在月光下喝茶") is False
     assert bot._should_web_search_image_prompt("img 梵高风格的向日葵") is False
+
+
+def test_av_cover_parsing_and_r18dev_dmm_allow_list(monkeypatch):
+    monkeypatch.setattr(bot, "BOT_USERNAME", "any_bot")
+
+    assert bot._av_cover_argument(
+        SimpleNamespace(text="/av abc-000", caption=None)
+    ) == (True, "abc-000")
+    assert bot._av_cover_argument(
+        SimpleNamespace(text="/av@any_bot ABC000", caption=None)
+    ) == (True, "ABC000")
+    assert bot._av_cover_argument(
+        SimpleNamespace(text="/av@other_bot ABC000", caption=None)
+    ) == (False, None)
+    assert bot._av_cover_argument(
+        SimpleNamespace(text=None, caption="/av ABC000")
+    ) == (True, "ABC000")
+
+    assert bot._normalize_av_cover_code("abc-000") == "ABC000"
+    assert bot._normalize_av_cover_code("ABC_000") == "ABC000"
+    for invalid in ("ABC", "abc 000", "abc-000;evil", "../ABC000"):
+        assert bot._normalize_av_cover_code(invalid) is None
+
+    title, cover_url = bot._r18dev_cover_from_payload(
+        {
+            "title": "<unsafe & title>",
+            "images": {
+                "jacket_image": {
+                    "large2": "https://pics.dmm.co.jp/digital/video/demo/demopl.jpg"
+                }
+            },
+        }
+    )
+    assert title == "<unsafe & title>"
+    assert cover_url.endswith("demopl.jpg")
+    assert "&lt;unsafe &amp; title&gt;" in bot._format_r18dev_cover_caption(
+        "ABC000", title
+    )
+
+    for unsafe_url in (
+        "http://pics.dmm.co.jp/digital/video/demo/demopl.jpg",
+        "https://evil.example/digital/video/demo/demopl.jpg",
+        "https://pics.dmm.co.jp/not-digital/video/demopl.jpg",
+        "https://pics.dmm.co.jp/digital/video/demo/demopl.jpg?redirect=evil",
+        "https://user@pics.dmm.co.jp/digital/video/demo/demopl.jpg",
+    ):
+        try:
+            bot._r18dev_cover_from_payload(
+                {"images": {"jacket_image": {"large2": unsafe_url}}}
+            )
+        except bot.R18DevError:
+            pass
+        else:
+            raise AssertionError(unsafe_url)
+
+
+def test_av_code_route_does_not_access_replied_image(monkeypatch):
+    seen = []
+
+    async def fake_cover(msg, chat, context, code):
+        seen.append((msg.text, msg.caption, chat.id, code))
+
+    def fail_if_image_is_read(msg):
+        raise AssertionError("code lookup must not inspect a replied image")
+
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
+    monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
+    monkeypatch.setattr(bot, "_av_cover_cmd", fake_cover)
+    monkeypatch.setattr(bot, "_avscan_image_source", fail_if_image_is_read)
+
+    chat = SimpleNamespace(id=-100123, type=bot.ChatType.SUPERGROUP)
+    for text, caption in (("/av ABC-000", None), (None, "/av ABC-000")):
+        msg = SimpleNamespace(
+            text=text,
+            caption=caption,
+            message_id=10,
+            from_user=SimpleNamespace(id=1),
+            reply_to_message=SimpleNamespace(
+                photo=[SimpleNamespace(file_id="unrelated")]
+            ),
+        )
+        asyncio.run(
+            bot.av_cmd(
+                SimpleNamespace(effective_message=msg, effective_chat=chat),
+                SimpleNamespace(),
+            )
+        )
+    assert seen == [
+        ("/av ABC-000", None, -100123, "ABC-000"),
+        (None, "/av ABC-000", -100123, "ABC-000"),
+    ]
+
+
+def test_av_cover_command_sends_jacket_and_schedules_cleanup(monkeypatch):
+    calls = {"deleted": [], "cleanup": []}
+
+    class Status:
+        chat_id = -100123
+        message_id = 101
+
+        async def edit_text(self, text, **kwargs):
+            raise AssertionError(f"unexpected error status: {text}")
+
+    async def fake_reply_text(msg, text, **kwargs):
+        assert text == "🖼 正在查询 R18.dev 封面..."
+        return Status()
+
+    async def fake_lookup(dvd_id):
+        assert dvd_id == "ABC000"
+        return "<unsafe & title>", "https://pics.dmm.co.jp/digital/video/demo/demopl.jpg"
+
+    async def fake_download(cover_url):
+        assert cover_url.endswith("demopl.jpg")
+        return b"jpeg-bytes"
+
+    async def fake_reply_photo(*, photo, caption, parse_mode):
+        assert photo.name == "cover.jpg"
+        assert photo.read() == b"jpeg-bytes"
+        assert "&lt;unsafe &amp; title&gt;" in caption
+        assert parse_mode == bot.ParseMode.HTML
+        return SimpleNamespace(message_id=102)
+
+    async def fake_delete_message(**kwargs):
+        calls["deleted"].append(kwargs)
+
+    def fake_schedule(context, chat_id, *messages):
+        calls["cleanup"].append((chat_id, [getattr(m, "message_id", None) for m in messages]))
+
+    monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
+    monkeypatch.setattr(bot, "_lookup_r18dev_cover", fake_lookup)
+    monkeypatch.setattr(bot, "_download_r18dev_cover", fake_download)
+    monkeypatch.setattr(bot, "_schedule_av_cleanup", fake_schedule)
+
+    msg = SimpleNamespace(message_id=100, reply_photo=fake_reply_photo)
+    chat = SimpleNamespace(id=-100123)
+    context = SimpleNamespace(bot=SimpleNamespace(delete_message=fake_delete_message))
+    asyncio.run(bot._av_cover_cmd(msg, chat, context, "abc-000"))
+
+    assert calls["deleted"] == [{"chat_id": -100123, "message_id": 101}]
+    assert calls["cleanup"] == [(-100123, [100, 101, 102])]
+
+
+def test_plain_av_image_caption_stays_on_avscan_path(monkeypatch):
+    calls = {"download": [], "upload": [], "edits": [], "cleanup": []}
+
+    class Status:
+        message_id = 101
+
+        async def edit_text(self, text, **kwargs):
+            calls["edits"].append((text, kwargs))
+
+    async def fake_reply_text(msg, text, **kwargs):
+        assert text == "🔎 AVScan 检索中..."
+        return Status()
+
+    async def fake_download_telegram(context, file_id, *, max_bytes):
+        calls["download"].append((file_id, max_bytes))
+        return b"source"
+
+    async def fake_search(upload):
+        calls["upload"].append(upload)
+        return {"results": []}
+
+    def fake_source(msg):
+        return "image-file", msg
+
+    def fake_schedule(context, chat_id, *messages):
+        calls["cleanup"].append((chat_id, [getattr(m, "message_id", None) for m in messages]))
+
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
+    monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
+    monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
+    monkeypatch.setattr(bot, "_avscan_image_source", fake_source)
+    monkeypatch.setattr(bot, "_download_telegram_file", fake_download_telegram)
+    monkeypatch.setattr(bot, "_prepare_avscan_image", lambda source: b"upload")
+    monkeypatch.setattr(bot, "_search_avscan", fake_search)
+    monkeypatch.setattr(bot, "_format_avscan_results", lambda payload: "result")
+    monkeypatch.setattr(bot, "_schedule_av_cleanup", fake_schedule)
+
+    msg = SimpleNamespace(
+        text=None,
+        caption="/av",
+        message_id=100,
+        from_user=SimpleNamespace(id=1),
+    )
+    chat = SimpleNamespace(id=-100123, type=bot.ChatType.SUPERGROUP)
+    asyncio.run(
+        bot.av_cmd(
+            SimpleNamespace(effective_message=msg, effective_chat=chat),
+            SimpleNamespace(),
+        )
+    )
+
+    assert calls["download"] == [("image-file", bot.AVSCAN_MAX_SOURCE_BYTES)]
+    assert calls["upload"] == [b"upload"]
+    assert calls["edits"] == [("result", {"parse_mode": bot.ParseMode.HTML, "disable_web_page_preview": True})]
+    assert calls["cleanup"] == [(-100123, [100, 100, 101])]
 
 
 def test_enrich_image_prompt_with_web_context_includes_real_search_data():
