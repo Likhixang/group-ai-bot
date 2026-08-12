@@ -58,7 +58,7 @@ DS_MODEL = (
 ).strip()
 AI_THINKING_MODEL = os.getenv("AI_THINKING_MODEL", "ds-4.1-thinking").strip()
 OAI_MODEL = os.getenv("OAI_MODEL", "gpt-5.5").strip()
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.5").strip()
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
 MEMORY_MAX_TURNS = int(os.getenv("MEMORY_MAX_TURNS", "8"))
