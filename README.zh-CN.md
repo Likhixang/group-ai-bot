@@ -19,8 +19,10 @@ cp .env.example .env
 - `AI_API_KEY`
 - （可选）`AI_MODEL`
 - （可选）`OAI_MODEL`
-- （可选）`IMAGE_MODEL`
-- （可选）`IMAGE_EDIT_MODEL`
+- （可选）`IMAGEFREE_BASE_URL` — imagefree 图片 API 地址
+- （可选）`IMAGE_MODEL` — imagefree 风格预设：default / anime / realistic / watercolor / ink / cyberpunk
+- （可选）`IMAGE_EDIT_MODEL` — 图生图预设（仅 default / watercolor / cyberpunk 可用）
+- （可选）`IMAGE_ASPECT_RATIO` — 画幅：1:1 / 3:4 / 4:3 / 9:16 / 16:9
 
 - （可选）`MEMORY_MAX_TURNS`
 

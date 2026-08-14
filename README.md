@@ -19,8 +19,10 @@ Edit `.env` and fill in:
 - `AI_API_KEY`
 - (optional) `AI_MODEL`
 - (optional) `OAI_MODEL`
-- (optional) `IMAGE_MODEL`
-- (optional) `IMAGE_EDIT_MODEL`
+- (optional) `IMAGEFREE_BASE_URL` — imagefree 图片 API 地址
+- (optional) `IMAGE_MODEL` — imagefree 风格预设: default / anime / realistic / watercolor / ink / cyberpunk
+- (optional) `IMAGE_EDIT_MODEL` — 图生图预设（仅 default / watercolor / cyberpunk 可用）
+- (optional) `IMAGE_ASPECT_RATIO` — 画幅: 1:1 / 3:4 / 4:3 / 9:16 / 16:9
 
 - (optional) `MEMORY_MAX_TURNS`
 
