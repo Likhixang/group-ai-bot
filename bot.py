@@ -3240,6 +3240,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "  回复图片或上传图片写 /vid 描述 — 图生视频\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
             "/ip IP地址 — 查 IP 纯净度评分（多源聚合）\n"
+            "/whois 域名 — 查域名 WHOIS 信息（注册商/时间/NS/状态）\n"
             "/ping 域名 — 从全球节点测延迟（支持指定 DNS/地区）\n"
             "/http URL — 从全球节点 HTTP 测速（支持指定地区）\n"
             "/context 模型名 — 查询 OpenRouter/models.dev 上的上下文长度\n"
@@ -5807,6 +5808,99 @@ async def ip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply_and_cleanup(msg, context, f"❌ 检测异常: {e}", NOTICE_DELETE_TTL)
 
 
+async def whois_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """查域名 WHOIS 信息。用法：/whois <域名>"""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    uid = msg.from_user.id if msg.from_user else None
+    if not _is_private_super_admin(chat, uid):
+        if not _is_allowed_chat(chat):
+            await _reply_not_allowed_and_cleanup(msg, context)
+            return
+        if not _is_allowed_topic(msg):
+            await _reply_not_allowed_and_cleanup(msg, context)
+            return
+
+    args = context.args
+    if not args:
+        await _reply_and_cleanup(
+            msg,
+            context,
+            "用法: `/whois <域名>`\n例如: `/whois linux.do`", NOTICE_DELETE_TTL,
+        )
+        return
+
+    domain = args[0].strip().lower()
+    # 清理协议、路径、端口、超链接等
+    for prefix in ("http://", "https://"):
+        if domain.startswith(prefix):
+            domain = domain[len(prefix):]
+    domain = domain.split("/")[0].split(":")[0].rstrip(".").strip()
+
+    if not re.match(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", domain):
+        await _reply_and_cleanup(
+            msg, context, f"❌ 无效的域名: `{domain}`", NOTICE_DELETE_TTL,
+        )
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(f"https://api.tian.hu/whois/{domain}")
+            resp.raise_for_status()
+            data = resp.json()
+
+        if not data or data.get("code") != 200 or not data.get("data"):
+            reason = (data or {}).get("message") or "无查询结果"
+            await _reply_and_cleanup(
+                msg, context, f"❌ WHOIS 查询失败: {reason}", NOTICE_DELETE_TTL,
+            )
+            return
+
+        info = data["data"]
+        fm = info.get("formatted") or {}
+        dom = fm.get("domain") or {}
+
+        # 解析字段（有的域名某些字段缺失）
+        def _d(*keys, default="N/A"):
+            for k in keys:
+                v = dom.get(k)
+                if v:
+                    return v
+            return default
+
+        created = str(_d("created_date", "created_date_utc"))[:10]
+        expired = str(_d("expired_date", "expired_date_utc"))[:10]
+        updated = str(_d("updated_date", "updated_date_utc"))[:10]
+
+        registrar = (fm.get("registrar") or {}).get("registrar_name") or "N/A"
+        registrant = (fm.get("registrant") or {}).get("registrant_name") or "N/A"
+
+        ns_list = dom.get("name_servers") or []
+        status_list = dom.get("status") or []
+
+        lines = [
+            f"🔍 WHOIS `{info.get('domain') or domain}`",
+            f"注册商: `{registrar}`",
+            f"注册人: `{registrant}`",
+            f"创建: `{created}` 到期: `{expired}` 更新: `{updated}`",
+        ]
+        if status_list:
+            lines.append(f"状态: `{'`, `'.join(status_list)}`")
+        if ns_list:
+            lines.append(f"NS: `{'`, `'.join(ns_list)}`")
+
+        await _reply_and_cleanup(
+            msg, context, "\n".join(lines), NOTICE_DELETE_TTL,
+        )
+    except Exception as e:
+        logger.exception("whois_cmd failed for %s", domain)
+        await _reply_and_cleanup(
+            msg, context, f"❌ WHOIS 查询异常: {e}", NOTICE_DELETE_TTL,
+        )
+
+
 async def post_init(application: Application) -> None:
     global BOT_USERNAME, BOT_ID
     me = await application.bot.get_me()
@@ -5832,6 +5926,7 @@ async def post_init(application: Application) -> None:
         BotCommand("unpin", "取消置顶并停用每日自动置顶（仅超管）"),
         BotCommand("start", "启动说明"),
         BotCommand("ip", "查 IP 纯净度评分"),
+        BotCommand("whois", "查域名 WHOIS 信息"),
         BotCommand("ping", "ping 测试域名延迟"),
         BotCommand("http", "从全球节点 HTTP 测速"),
         BotCommand("context", "查询模型上下文长度"),
@@ -5903,6 +5998,7 @@ def main() -> None:
     app.add_handler(CommandHandler("allow", allow_cmd))
     app.add_handler(CommandHandler(["ds", "gk"], ai_cmd))
     app.add_handler(CommandHandler("ip", ip_cmd))
+    app.add_handler(CommandHandler("whois", whois_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("http", http_cmd))
     app.add_handler(CommandHandler("context", context_cmd))
