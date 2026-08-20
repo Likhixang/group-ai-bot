@@ -161,8 +161,22 @@ AVSCAN_MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 AVSCAN_MAX_IMAGE_PIXELS = 40_000_000
 AVSCAN_MAX_SIDE = 1024
 
-# --- 番号封面查询（R18.dev JSON → DMM jacket）---
-# R18.dev 的 DVD ID JSON 返回 DMM jacket URL；每次命令只请求一次。
+# --- 番号封面查询（Fourhoi 直猜主源 → R18.dev JSON fallback）---
+# Fourhoi 是 MissAV 的封面图床，URL 规则可直猜且无 CF 防护：
+#   https://fourhoi.com/{slug}/cover.jpg     高清 800px
+#   https://fourhoi.com/{slug}/cover-t.jpg   缩略图 330px
+# 每次命令按候选逐个请求，直到命中或全部 404 再走 R18.dev。
+FOURHOI_COVER_HOST = "fourhoi.com"
+FOURHOI_COVER_URL = "https://fourhoi.com/{slug}/cover.jpg"
+FOURHOI_COVER_THUMB_URL = "https://fourhoi.com/{slug}/cover-t.jpg"
+FOURHOI_TIMEOUT = max(5, int(os.getenv("FOURHOI_TIMEOUT", "20")))
+FOURHOI_MAX_COVER_BYTES = 8 * 1024 * 1024
+FOURHOI_MAX_COVER_PIXELS = 40_000_000
+FOURHOI_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
+# R18.dev 的 DVD ID JSON 返回 DMM jacket URL；Fourhoi 未命中时兜底。
 R18DEV_LOOKUP_URL = "https://r18.dev/videos/vod/movies/detail/-/dvd_id={dvd_id}/json"
 R18DEV_TIMEOUT = max(5, int(os.getenv("R18DEV_TIMEOUT", "30")))
 R18DEV_MAX_JSON_BYTES = 1 * 1024 * 1024
@@ -2924,6 +2938,23 @@ async def _search_avscan(image_bytes: bytes) -> dict:
     return payload
 
 
+class FourhoiError(RuntimeError):
+    """A safe, user-facing failure from the Fourhoi cover lookup."""
+
+
+class FourhoiNotFoundError(FourhoiError):
+    """Fourhoi has no cover for the requested slug."""
+
+
+def _normalize_fourhoi_slug(raw_code: str) -> Optional[str]:
+    """Return a safe lowercase Fourhoi slug, or None when invalid."""
+    code = (raw_code or "").strip().lower()
+    if not AV_COVER_CODE_RE.fullmatch(code):
+        return None
+    slug = code.replace("_", "-")
+    return slug if 3 <= len(slug) <= 48 else None
+
+
 class R18DevError(RuntimeError):
     """A safe, user-facing failure from the R18.dev cover lookup."""
 
@@ -3073,6 +3104,125 @@ def _r18dev_cover_file(image_bytes: bytes) -> BytesIO:
     bio.name = "cover.jpg"
     bio.seek(0)
     return bio
+
+
+def _validate_fourhoi_cover_url(cover_url: str) -> str:
+    """Accept only the expected https fourhoi.com cover URL shape."""
+    if not isinstance(cover_url, str) or not cover_url:
+        raise FourhoiError("Fourhoi returned an invalid cover URL")
+    try:
+        parsed = urllib.parse.urlsplit(cover_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise FourhoiError("Fourhoi returned an invalid cover URL") from exc
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() != FOURHOI_COVER_HOST
+        or parsed.username
+        or parsed.password
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+        or not (
+            parsed.path.endswith("/cover.jpg")
+            or parsed.path.endswith("/cover-t.jpg")
+        )
+        or not parsed.path.lower().endswith(".jpg")
+    ):
+        raise FourhoiError("Fourhoi returned an unexpected cover URL")
+    return cover_url
+
+
+async def _lookup_fourhoi_cover(slug: str) -> tuple[str, str]:
+    """Guess a Fourhoi cover URL for a slug, trying the HD cover first.
+
+    Returns ``(title, cover_url)``; Fourhoi carries no title metadata, so the
+    title is empty and the caller falls back to the requested code. Raises
+    ``FourhoiNotFoundError`` when every candidate 404s.
+    """
+    timeout = httpx.Timeout(connect=10, read=FOURHOI_TIMEOUT, write=15, pool=10)
+    headers = {
+        "Accept": "image/jpeg,image/*;q=0.8,*/*;q=0.5",
+        "User-Agent": FOURHOI_USER_AGENT,
+    }
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=False, trust_env=False
+    ) as client:
+        for template in (FOURHOI_COVER_URL, FOURHOI_COVER_THUMB_URL):
+            cover_url = _validate_fourhoi_cover_url(
+                template.format(slug=urllib.parse.quote(slug, safe="-"))
+            )
+            try:
+                async with client.stream(
+                    "GET", cover_url, headers=headers
+                ) as response:
+                    if response.status_code == 404:
+                        continue
+                    if 300 <= response.status_code < 400:
+                        raise FourhoiError(
+                            f"Fourhoi cover unexpected redirect {response.status_code}"
+                        )
+                    if response.status_code == 429:
+                        raise FourhoiError("Fourhoi rate limited the lookup")
+                    if response.status_code >= 400:
+                        raise FourhoiError(
+                            f"Fourhoi cover HTTP {response.status_code}"
+                        )
+                    if not response.headers.get(
+                        "content-type", ""
+                    ).lower().startswith("image/"):
+                        raise FourhoiError("Fourhoi did not return an image")
+                    return "", cover_url
+            except FourhoiError:
+                raise
+            except Exception as exc:
+                raise FourhoiError(
+                    f"Fourhoi cover lookup failed: {type(exc).__name__}"
+                ) from exc
+    raise FourhoiNotFoundError(f"Fourhoi has no cover for {slug}")
+
+
+async def _download_fourhoi_cover(cover_url: str) -> bytes:
+    """Download the allow-listed Fourhoi cover without following redirects."""
+    cover_url = _validate_fourhoi_cover_url(cover_url)
+    timeout = httpx.Timeout(connect=10, read=FOURHOI_TIMEOUT, write=15, pool=10)
+    headers = {"Accept": "image/jpeg", "User-Agent": FOURHOI_USER_AGENT}
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=False, trust_env=False
+    ) as client:
+        async with client.stream("GET", cover_url, headers=headers) as response:
+            if 300 <= response.status_code < 400:
+                raise FourhoiError(
+                    f"Fourhoi cover unexpected redirect {response.status_code}"
+                )
+            if response.status_code == 429:
+                raise FourhoiError("Fourhoi rate limited the cover download")
+            if response.status_code >= 400:
+                raise FourhoiError(f"Fourhoi cover HTTP {response.status_code}")
+            if not response.headers.get(
+                "content-type", ""
+            ).lower().startswith("image/"):
+                raise FourhoiError("Fourhoi did not return an image")
+            try:
+                body = await _read_limited_http_body(
+                    response, FOURHOI_MAX_COVER_BYTES
+                )
+            except R18DevError as exc:
+                raise FourhoiError(str(exc)) from exc
+
+    try:
+        with Image.open(BytesIO(body)) as cover:
+            width, height = cover.size
+            if width < 1 or height < 1 or width * height > FOURHOI_MAX_COVER_PIXELS:
+                raise FourhoiError("Fourhoi returned an invalid cover size")
+            if cover.format not in {"JPEG", "WEBP", "PNG"}:
+                raise FourhoiError("Fourhoi returned an unsupported cover format")
+            cover.verify()
+    except FourhoiError:
+        raise
+    except (OSError, Image.DecompressionBombError) as exc:
+        raise FourhoiError("Fourhoi returned an invalid cover image") from exc
+    return body
 
 
 def _avscan_number(value) -> float:
@@ -3235,7 +3385,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"/gk 或 gk 你的问题 — 对话 ({GROK_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
             "/edit 或 edit 要求 — 回复图片改图（或上传图+写 caption）\n"
-            "/av 番号 — 查询 R18.dev 封面；回复图片发 /av，或图片 caption 写 /av 检索番号（AVScan）\n"
+            "/av 番号 — 查询封面（Fourhoi → R18.dev）；回复图片发 /av，或图片 caption 写 /av 检索番号（AVScan）\n"
             "/vid 或 vid 描述 — 生成视频（约 3 秒，要等 1-2 分钟）\n"
             "  回复图片或上传图片写 /vid 描述 — 图生视频\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
@@ -3956,11 +4106,11 @@ async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await on_image_request(update, context)
 
 
-def _format_r18dev_cover_caption(dvd_id: str, title: str) -> str:
-    """Render bounded, escaped R18.dev metadata for Telegram HTML captions."""
+def _format_av_cover_caption(dvd_id: str, title: str, source_label: str = "Fourhoi") -> str:
+    """Render bounded, escaped cover metadata for Telegram HTML captions."""
     compact_title = " ".join((title or "").split())[:120]
     lines = [
-        "🖼 <b>R18.dev 封面</b>",
+        f"🖼 <b>{escape(source_label)} 封面</b>",
         f"番号：<code>{escape(dvd_id)}</code>",
     ]
     if compact_title:
@@ -3971,9 +4121,10 @@ def _format_r18dev_cover_caption(dvd_id: str, title: str) -> str:
 async def _av_cover_cmd(
     msg, chat, context: ContextTypes.DEFAULT_TYPE, raw_cover_code: str
 ) -> None:
-    """Fetch one R18.dev jacket for a validated `/av <番号>` command."""
+    """Fetch one cover for `/av <番号>`: Fourhoi guess first, R18.dev fallback."""
     dvd_id = _normalize_av_cover_code(raw_cover_code)
-    if not dvd_id:
+    slug = _normalize_fourhoi_slug(raw_cover_code)
+    if not dvd_id or not slug:
         await _reply_and_cleanup(
             msg,
             context,
@@ -3984,25 +4135,45 @@ async def _av_cover_cmd(
         return
 
     try:
-        status = await _reply_text_and_track(msg, "🖼 正在查询 R18.dev 封面...")
+        status = await _reply_text_and_track(msg, "🖼 正在查询封面...")
     except Exception:
-        logger.exception("r18dev status reply failed: chat=%s msg=%s", chat.id, msg.message_id)
+        logger.exception("cover status reply failed: chat=%s msg=%s", chat.id, msg.message_id)
         _schedule_av_cleanup(context, chat.id, msg)
         return
 
     cover_message = None
+    source_label = "Fourhoi"
     try:
-        title, cover_url = await _lookup_r18dev_cover(dvd_id)
-        image_bytes = await _download_r18dev_cover(cover_url)
+        try:
+            title, cover_url = await _lookup_fourhoi_cover(slug)
+            image_bytes = await _download_fourhoi_cover(cover_url)
+            logger.info(
+                "fourhoi_cover_complete: chat=%s msg=%s cover_bytes=%s",
+                chat.id,
+                msg.message_id,
+                len(image_bytes),
+            )
+        except FourhoiError:
+            # Fourhoi missed (404/rate-limited/unreachable) → R18.dev fallback.
+            source_label = "R18.dev"
+            title, cover_url = await _lookup_r18dev_cover(dvd_id)
+            image_bytes = await _download_r18dev_cover(cover_url)
+            logger.info(
+                "r18dev_cover_fallback: chat=%s msg=%s cover_bytes=%s",
+                chat.id,
+                msg.message_id,
+                len(image_bytes),
+            )
         cover_message = await msg.reply_photo(
             photo=_r18dev_cover_file(image_bytes),
-            caption=_format_r18dev_cover_caption(dvd_id, title),
+            caption=_format_av_cover_caption(dvd_id, title, source_label),
             parse_mode=ParseMode.HTML,
         )
         logger.info(
-            "r18dev_cover_complete: chat=%s msg=%s cover_bytes=%s",
+            "av_cover_complete: chat=%s msg=%s source=%s cover_bytes=%s",
             chat.id,
             msg.message_id,
+            source_label,
             len(image_bytes),
         )
         try:
@@ -4012,22 +4183,22 @@ async def _av_cover_cmd(
         except Exception:
             pass
     except R18DevNotFoundError:
-        logger.info("r18dev cover not found: chat=%s msg=%s", chat.id, msg.message_id)
-        await status.edit_text("🔎 R18.dev 没有找到这个番号的可用封面。")
+        logger.info("cover not found: chat=%s msg=%s", chat.id, msg.message_id)
+        await status.edit_text("🔎 没有找到这个番号的可用封面。")
     except R18DevRateLimitedError:
         logger.warning("r18dev rate limited: chat=%s msg=%s", chat.id, msg.message_id)
         await status.edit_text("⏳ R18.dev 当前请求过多，请稍后再试。")
     except Exception as exc:
         logger.warning(
-            "r18dev cover lookup failed: chat=%s msg=%s error=%s",
+            "cover lookup failed: chat=%s msg=%s error=%s",
             chat.id,
             msg.message_id,
             type(exc).__name__,
         )
         try:
-            await status.edit_text("❌ R18.dev 封面服务暂时不可用，请稍后再试。")
+            await status.edit_text("❌ 封面服务暂时不可用，请稍后再试。")
         except Exception:
-            logger.exception("r18dev failure reply edit failed: chat=%s msg=%s", chat.id, msg.message_id)
+            logger.exception("cover failure reply edit failed: chat=%s msg=%s", chat.id, msg.message_id)
     finally:
         _schedule_av_cleanup(context, chat.id, msg, status, cover_message)
 

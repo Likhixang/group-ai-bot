@@ -95,6 +95,11 @@ def test_av_cover_parsing_and_r18dev_dmm_allow_list(monkeypatch):
     for invalid in ("ABC", "abc 000", "abc-000;evil", "../ABC000"):
         assert bot._normalize_av_cover_code(invalid) is None
 
+    assert bot._normalize_fourhoi_slug("abc-000") == "abc-000"
+    assert bot._normalize_fourhoi_slug("ABC_000") == "abc-000"
+    for invalid in ("ABC", "abc 000", "abc-000;evil", "../ABC000"):
+        assert bot._normalize_fourhoi_slug(invalid) is None
+
     title, cover_url = bot._r18dev_cover_from_payload(
         {
             "title": "<unsafe & title>",
@@ -107,9 +112,11 @@ def test_av_cover_parsing_and_r18dev_dmm_allow_list(monkeypatch):
     )
     assert title == "<unsafe & title>"
     assert cover_url.endswith("demopl.jpg")
-    assert "&lt;unsafe &amp; title&gt;" in bot._format_r18dev_cover_caption(
+    assert "&lt;unsafe &amp; title&gt;" in bot._format_av_cover_caption(
         "ABC000", title
     )
+    assert "Fourhoi" in bot._format_av_cover_caption("ABC000", title)
+    assert "R18.dev" in bot._format_av_cover_caption("ABC000", title, "R18.dev")
 
     for unsafe_url in (
         "http://pics.dmm.co.jp/digital/video/demo/demopl.jpg",
@@ -123,6 +130,23 @@ def test_av_cover_parsing_and_r18dev_dmm_allow_list(monkeypatch):
                 {"images": {"jacket_image": {"large2": unsafe_url}}}
             )
         except bot.R18DevError:
+            pass
+        else:
+            raise AssertionError(unsafe_url)
+
+    assert bot._validate_fourhoi_cover_url(
+        "https://fourhoi.com/abc-000/cover.jpg"
+    ) == "https://fourhoi.com/abc-000/cover.jpg"
+    for unsafe_url in (
+        "http://fourhoi.com/abc-000/cover.jpg",
+        "https://evil.example/abc-000/cover.jpg",
+        "https://fourhoi.com/abc-000/cover.jpg?x=1",
+        "https://fourhoi.com/abc-000/poster.jpg",
+        "https://user@fourhoi.com/abc-000/cover.jpg",
+    ):
+        try:
+            bot._validate_fourhoi_cover_url(unsafe_url)
+        except bot.FourhoiError:
             pass
         else:
             raise AssertionError(unsafe_url)
@@ -176,20 +200,84 @@ def test_av_cover_command_sends_jacket_and_schedules_cleanup(monkeypatch):
             raise AssertionError(f"unexpected error status: {text}")
 
     async def fake_reply_text(msg, text, **kwargs):
-        assert text == "🖼 正在查询 R18.dev 封面..."
+        assert text == "🖼 正在查询封面..."
         return Status()
 
-    async def fake_lookup(dvd_id):
+    async def fake_lookup_fourhoi(slug):
+        assert slug == "abc-000"
+        return "", "https://fourhoi.com/abc-000/cover.jpg"
+
+    async def fake_download_fourhoi(cover_url):
+        assert cover_url.endswith("cover.jpg")
+        return b"jpeg-bytes"
+
+    async def fake_lookup_r18dev(dvd_id):
+        raise AssertionError("fourhoi success must not fall back to r18dev")
+
+    async def fake_download_r18dev(cover_url):
+        raise AssertionError("fourhoi success must not fall back to r18dev")
+
+    async def fake_reply_photo(*, photo, caption, parse_mode):
+        assert photo.name == "cover.jpg"
+        assert photo.read() == b"jpeg-bytes"
+        assert "&lt;unsafe &amp; title&gt;" in caption or "Fourhoi" in caption
+        assert parse_mode == bot.ParseMode.HTML
+        return SimpleNamespace(message_id=102)
+
+    async def fake_delete_message(**kwargs):
+        calls["deleted"].append(kwargs)
+
+    def fake_schedule(context, chat_id, *messages):
+        calls["cleanup"].append((chat_id, [getattr(m, "message_id", None) for m in messages]))
+
+    monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
+    monkeypatch.setattr(bot, "_lookup_fourhoi_cover", fake_lookup_fourhoi)
+    monkeypatch.setattr(bot, "_download_fourhoi_cover", fake_download_fourhoi)
+    monkeypatch.setattr(bot, "_lookup_r18dev_cover", fake_lookup_r18dev)
+    monkeypatch.setattr(bot, "_download_r18dev_cover", fake_download_r18dev)
+    monkeypatch.setattr(bot, "_schedule_av_cleanup", fake_schedule)
+
+    msg = SimpleNamespace(message_id=100, reply_photo=fake_reply_photo)
+    chat = SimpleNamespace(id=-100123)
+    context = SimpleNamespace(bot=SimpleNamespace(delete_message=fake_delete_message))
+    asyncio.run(bot._av_cover_cmd(msg, chat, context, "abc-000"))
+
+    assert calls["deleted"] == [{"chat_id": -100123, "message_id": 101}]
+    assert calls["cleanup"] == [(-100123, [100, 101, 102])]
+
+
+def test_av_cover_command_falls_back_to_r18dev_when_fourhoi_misses(monkeypatch):
+    calls = {"deleted": [], "cleanup": []}
+
+    class Status:
+        chat_id = -100123
+        message_id = 101
+
+        async def edit_text(self, text, **kwargs):
+            raise AssertionError(f"unexpected error status: {text}")
+
+    async def fake_reply_text(msg, text, **kwargs):
+        assert text == "🖼 正在查询封面..."
+        return Status()
+
+    async def fake_lookup_fourhoi(slug):
+        raise bot.FourhoiNotFoundError("fourhoi has no cover for abc-000")
+
+    async def fake_download_fourhoi(cover_url):
+        raise AssertionError("fallback should not download from fourhoi")
+
+    async def fake_lookup_r18dev(dvd_id):
         assert dvd_id == "ABC000"
         return "<unsafe & title>", "https://pics.dmm.co.jp/digital/video/demo/demopl.jpg"
 
-    async def fake_download(cover_url):
+    async def fake_download_r18dev(cover_url):
         assert cover_url.endswith("demopl.jpg")
         return b"jpeg-bytes"
 
     async def fake_reply_photo(*, photo, caption, parse_mode):
         assert photo.name == "cover.jpg"
         assert photo.read() == b"jpeg-bytes"
+        assert "R18.dev" in caption
         assert "&lt;unsafe &amp; title&gt;" in caption
         assert parse_mode == bot.ParseMode.HTML
         return SimpleNamespace(message_id=102)
@@ -201,8 +289,10 @@ def test_av_cover_command_sends_jacket_and_schedules_cleanup(monkeypatch):
         calls["cleanup"].append((chat_id, [getattr(m, "message_id", None) for m in messages]))
 
     monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
-    monkeypatch.setattr(bot, "_lookup_r18dev_cover", fake_lookup)
-    monkeypatch.setattr(bot, "_download_r18dev_cover", fake_download)
+    monkeypatch.setattr(bot, "_lookup_fourhoi_cover", fake_lookup_fourhoi)
+    monkeypatch.setattr(bot, "_download_fourhoi_cover", fake_download_fourhoi)
+    monkeypatch.setattr(bot, "_lookup_r18dev_cover", fake_lookup_r18dev)
+    monkeypatch.setattr(bot, "_download_r18dev_cover", fake_download_r18dev)
     monkeypatch.setattr(bot, "_schedule_av_cleanup", fake_schedule)
 
     msg = SimpleNamespace(message_id=100, reply_photo=fake_reply_photo)
