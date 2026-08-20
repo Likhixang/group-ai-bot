@@ -5828,7 +5828,8 @@ async def whois_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply_and_cleanup(
             msg,
             context,
-            "用法: `/whois <域名>`\n例如: `/whois linux.do`", NOTICE_DELETE_TTL,
+            "用法: /whois &lt;域名&gt;\n例如: /whois linux.do", NOTICE_DELETE_TTL,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -5841,7 +5842,8 @@ async def whois_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not re.match(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", domain):
         await _reply_and_cleanup(
-            msg, context, f"❌ 无效的域名: `{domain}`", NOTICE_DELETE_TTL,
+            msg, context, f"❌ 无效的域名: {escape(domain)}", NOTICE_DELETE_TTL,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -5852,9 +5854,10 @@ async def whois_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             data = resp.json()
 
         if not data or data.get("code") != 200 or not data.get("data"):
-            reason = (data or {}).get("message") or "无查询结果"
+            reason = escape(str((data or {}).get("message") or "无查询结果"))
             await _reply_and_cleanup(
                 msg, context, f"❌ WHOIS 查询失败: {reason}", NOTICE_DELETE_TTL,
+                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -5874,30 +5877,33 @@ async def whois_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         expired = str(_d("expired_date", "expired_date_utc"))[:10]
         updated = str(_d("updated_date", "updated_date_utc"))[:10]
 
-        registrar = (fm.get("registrar") or {}).get("registrar_name") or "N/A"
-        registrant = (fm.get("registrant") or {}).get("registrant_name") or "N/A"
+        registrar = escape(str((fm.get("registrar") or {}).get("registrar_name") or "N/A"))
+        registrant = escape(str((fm.get("registrant") or {}).get("registrant_name") or "N/A"))
+        domain_disp = escape(str(info.get("domain") or domain))
 
         ns_list = dom.get("name_servers") or []
         status_list = dom.get("status") or []
 
         lines = [
-            f"🔍 WHOIS `{info.get('domain') or domain}`",
-            f"注册商: `{registrar}`",
-            f"注册人: `{registrant}`",
-            f"创建: `{created}` 到期: `{expired}` 更新: `{updated}`",
+            f"🔍 WHOIS <b>{domain_disp}</b>",
+            f"注册商: <code>{registrar}</code>",
+            f"注册人: <code>{registrant}</code>",
+            f"创建: <code>{created}</code> 到期: <code>{expired}</code> 更新: <code>{updated}</code>",
         ]
         if status_list:
-            lines.append(f"状态: `{'`, `'.join(status_list)}`")
+            lines.append("状态: " + ", ".join(f"<code>{escape(str(s))}</code>" for s in status_list))
         if ns_list:
-            lines.append(f"NS: `{'`, `'.join(ns_list)}`")
+            lines.append("NS: " + ", ".join(f"<code>{escape(str(n))}</code>" for n in ns_list))
 
         await _reply_and_cleanup(
             msg, context, "\n".join(lines), NOTICE_DELETE_TTL,
+            parse_mode=ParseMode.HTML,
         )
     except Exception as e:
         logger.exception("whois_cmd failed for %s", domain)
         await _reply_and_cleanup(
-            msg, context, f"❌ WHOIS 查询异常: {e}", NOTICE_DELETE_TTL,
+            msg, context, f"❌ WHOIS 查询异常: {escape(str(e))}", NOTICE_DELETE_TTL,
+            parse_mode=ParseMode.HTML,
         )
 
 
