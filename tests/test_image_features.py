@@ -38,6 +38,23 @@ def test_clean_prompt_and_select_text_model_for_ds_and_gk():
     assert bot._is_text_ai_prefix("/gk 测试") is True
 
 
+def test_clean_prompt_and_select_text_model_for_gm():
+    assert bot.GEMINI_MODEL == "gemini-3.7-flash"
+    assert bot._clean_prompt("gm 你好") == "你好"
+    assert bot._clean_prompt("/gm 你好") == "你好"
+    assert bot._clean_prompt("gm") == ""
+    assert bot._clean_prompt("/gm") == ""
+    assert bot._select_text_model("gm 你好") == bot.GEMINI_MODEL
+    assert bot._select_text_model("/gm 你好") == bot.GEMINI_MODEL
+    assert bot._select_text_model("gm") == bot.GEMINI_MODEL
+    assert bot._select_text_model("/gm") == bot.GEMINI_MODEL
+    assert bot._is_text_ai_prefix("gm 测试") is True
+    assert bot._is_text_ai_prefix("/gm 测试") is True
+    assert bot._is_text_ai_prefix("gm") is True
+    assert bot._is_text_ai_prefix("/gm") is True
+    assert bot._is_text_ai_prefix("gmx 测试") is False
+
+
 def test_image_request_detection_handles_prefixes_and_commands():
     assert bot._is_image_generation_request("img 赛博朋克城市") is True
     assert bot._is_image_generation_request("/img 赛博朋克城市") is True
