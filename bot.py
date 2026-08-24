@@ -5036,9 +5036,9 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
 
-# linux.do 链接检测：链接以 https://linux.do 开头（含 http/www 变体防绕过；
-# 负向前瞻防止 linux.do.evil.com 这类子串误匹配）
-_LINUX_DO_URL_RE = re.compile(r"https?://(?:www\.)?linux\.do(?![a-z0-9.-])", re.IGNORECASE)
+# linux.do 链接检测：匹配 https://linux.do、linux.do/、https://www.linux.do、www.linux.do/
+# 等变体（协议与 www 可选；负向前瞻防止 linux.do.evil.com / linuxdo.com 误匹配）
+_LINUX_DO_URL_RE = re.compile(r"(?:https?://)?(?:www\.)?linux\.do(?![a-z0-9.-])", re.IGNORECASE)
 
 
 async def enforce_linux_do_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
