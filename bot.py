@@ -62,24 +62,11 @@ GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
 LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-5.6-luna").strip()
 LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "default").strip().lower()
-IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip().lower()
-# --- 图片生成 (imagefree API, https://imagefree.tingfengai.art) ---
-# 文生图：POST /v1/generate（同步等待出图，典型 20~45 秒）
-# 图生图：POST /v1/edit（异步提交，轮询 /v1/edit/tasks/{job_id}，上游排队约 1~5 分钟）
-IMAGEFREE_BASE_URL = os.getenv("IMAGEFREE_BASE_URL", "https://imagefree.tingfengai.art").strip().rstrip("/")
-# imagefree 风格预设（model 参数取值），非白名单值自动回退 default（兼容旧 .env 里的模型名）
-IMAGEFREE_TXT2IMG_MODELS = {"default", "anime", "realistic", "watercolor", "ink", "cyberpunk"}
-IMAGEFREE_IMG2IMG_MODELS = {"default", "watercolor", "cyberpunk"}
-if IMAGE_MODEL not in IMAGEFREE_TXT2IMG_MODELS:
-    IMAGE_MODEL = "default"
-if IMAGE_EDIT_MODEL not in IMAGEFREE_IMG2IMG_MODELS:
-    IMAGE_EDIT_MODEL = "default"
-# 画幅：1:1 / 3:4 / 4:3 / 9:16 / 16:9
-IMAGE_ASPECT_RATIO = os.getenv("IMAGE_ASPECT_RATIO", "1:1").strip()
-# 图生图异步任务轮询参数
-IMAGE_EDIT_POLL_INTERVAL = int(os.getenv("IMAGE_EDIT_POLL_INTERVAL", "10"))
-IMAGE_EDIT_POLL_TIMEOUT = int(os.getenv("IMAGE_EDIT_POLL_TIMEOUT", "600"))
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "agnes-image-2.1-flash").strip()
+IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
+# --- 图片生成 (AxonHub /v1/images/generations，OpenAI 兼容) ---
+# 文生图：POST {AI_BASE_URL}/images/generations
+# 图生图：同端点，附 image 字段（base64）
 MEMORY_MAX_TURNS = int(os.getenv("MEMORY_MAX_TURNS", "8"))
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "697735771"))
 MAX_CONCURRENT_UPDATES = int(os.getenv("MAX_CONCURRENT_UPDATES", "8"))
@@ -2618,82 +2605,36 @@ async def _ask_ai_once(messages, model_name: str, temperature: float = 0.2) -> s
     return str(content)
 
 
-async def _download_imagefree_image(image_url: str) -> bytes:
-    """下载 imagefree 返回的 R2 图片直链为 bytes。"""
-    if not image_url:
-        raise RuntimeError("imagefree 返回了空的 image_url")
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.get(image_url)
-        if resp.status_code >= 400:
-            raise RuntimeError(
-                f"imagefree 下载图片 HTTP {resp.status_code} from {image_url[:120]}"
-            )
-        return resp.content
-
-
-async def _poll_imagefree_task(
-    task_url: str,
-    timeout: int,
-    interval: int,
-    on_progress=None,
-) -> str:
-    """轮询 imagefree 异步任务直到 completed，返回图片 URL。"""
-    deadline = time.time() + timeout
-    last_status = None
-    async with httpx.AsyncClient(timeout=60) as client:
-        while time.time() < deadline:
-            resp = await client.get(task_url)
-            if resp.status_code == 404:
-                raise RuntimeError(f"imagefree 任务不存在: {task_url}")
-            if resp.status_code >= 400:
-                raise RuntimeError(f"imagefree 任务轮询 HTTP {resp.status_code}: {resp.text[:300]}")
-            data = resp.json()
-            status = (data.get("status") or "").lower()
-            if status == "completed":
-                return data.get("image_url") or ""
-            if status in {"error", "failed"}:
-                raise RuntimeError(f"imagefree 任务失败: {str(data.get('error') or data)[:300]}")
-            if status != last_status:
-                last_status = status
-                if on_progress:
-                    try:
-                        await on_progress(status)
-                    except Exception:
-                        pass
-            await asyncio.sleep(interval)
-    raise RuntimeError(f"imagefree 任务超时（{timeout}s）")
+def _extract_image_bytes(data: dict) -> bytes:
+    items = data.get("data") or []
+    if not items:
+        raise RuntimeError("image API returned no data")
+    first = items[0] or {}
+    b64 = first.get("b64_json")
+    if b64:
+        return base64.b64decode(b64)
+    url = first.get("url")
+    if not url:
+        raise RuntimeError("image API returned neither b64_json nor url")
+    # Download image from URL
+    resp = httpx.get(url, timeout=60)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"image download HTTP {resp.status_code} from {url[:120]}")
+    return resp.content
 
 
 async def _generate_image(prompt: str) -> bytes:
-    """文生图：imagefree /v1/generate（同步等待出图，典型 20~45 秒）。
-
-    高并发排队超过等待窗口时返回 202 + Location 头，按该地址轮询任务。
-    """
-    url = f"{IMAGEFREE_BASE_URL}/v1/generate"
-    payload = {"prompt": prompt, "aspect_ratio": IMAGE_ASPECT_RATIO}
-    if IMAGE_MODEL != "default":
-        payload["model"] = IMAGE_MODEL
+    base = AI_BASE_URL.rstrip("/")
+    headers = {"Authorization": f"Bearer {AI_API_KEY}"}
+    payload = {"model": IMAGE_MODEL, "prompt": prompt, "n": 1, "size": "1024x1024"}
     last_exc = None
     for attempt in range(IMAGE_GEN_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
-                resp = await client.post(url, json=payload)
-                if resp.status_code == 202:
-                    location = resp.headers.get("Location")
-                    if not location:
-                        raise RuntimeError("imagefree 202 响应缺少 Location 头")
-                    image_url = await _poll_imagefree_task(
-                        urllib.parse.urljoin(f"{IMAGEFREE_BASE_URL}/v1/generate", location),
-                        timeout=IMAGE_GEN_TIMEOUT,
-                        interval=5,
-                    )
-                    return await _download_imagefree_image(image_url)
+                resp = await client.post(f"{base}/images/generations", headers=headers, json=payload)
                 if resp.status_code >= 400:
-                    raise RuntimeError(f"imagefree 文生图 HTTP {resp.status_code}: {resp.text[:500]}")
-                data = resp.json()
-                if (data.get("status") or "") != "completed":
-                    raise RuntimeError(f"imagefree 文生图失败: {str(data)[:300]}")
-                return await _download_imagefree_image(data.get("image_url"))
+                    raise RuntimeError(f"Image HTTP {resp.status_code}: {resp.text[:500]}")
+                return _extract_image_bytes(resp.json())
         except Exception as e:
             if _is_timeout_error(e) and attempt < IMAGE_GEN_RETRIES:
                 last_exc = e
@@ -2703,38 +2644,26 @@ async def _generate_image(prompt: str) -> bytes:
 
 
 async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
-    """图生图：imagefree /v1/edit（异步提交 + 轮询，上游排队约 1~5 分钟）。
-
-    输入图 ≤4MB（data URI 提交）；超限先用 AVScan 的 JPEG 预处理缩小。
-    """
+    base = AI_BASE_URL.rstrip("/")
+    headers = {"Authorization": f"Bearer {AI_API_KEY}"}
     if len(image_bytes) > 4 * 1024 * 1024:
         image_bytes = _prepare_avscan_image(image_bytes)
-    mime = "image/png" if image_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+    img_b64 = base64.b64encode(image_bytes).decode()
     payload = {
-        "image": f"data:{mime};base64," + base64.b64encode(image_bytes).decode(),
+        "model": IMAGE_EDIT_MODEL,
         "prompt": prompt,
+        "image": img_b64,
+        "n": 1,
+        "size": "1024x1024",
     }
-    if IMAGE_EDIT_MODEL != "default":
-        payload["model"] = IMAGE_EDIT_MODEL
     last_exc = None
     for attempt in range(IMAGE_GEN_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(f"{IMAGEFREE_BASE_URL}/v1/edit", json=payload)
+            async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
+                resp = await client.post(f"{base}/images/generations", headers=headers, json=payload)
                 if resp.status_code >= 400:
-                    raise RuntimeError(f"imagefree 图生图 HTTP {resp.status_code}: {resp.text[:500]}")
-                data = resp.json()
-                task_id = data.get("id")
-                if not task_id:
-                    raise RuntimeError(f"imagefree 图生图无任务 id: {str(data)[:300]}")
-                image_url = await _poll_imagefree_task(
-                    f"{IMAGEFREE_BASE_URL}/v1/edit/tasks/{task_id}",
-                    timeout=IMAGE_EDIT_POLL_TIMEOUT,
-                    interval=IMAGE_EDIT_POLL_INTERVAL,
-                )
-                if not image_url:
-                    raise RuntimeError("imagefree 图生图完成但无 image_url")
-                return await _download_imagefree_image(image_url)
+                    raise RuntimeError(f"Image edit HTTP {resp.status_code}: {resp.text[:500]}")
+                return _extract_image_bytes(resp.json())
         except Exception as e:
             if _is_timeout_error(e) and attempt < IMAGE_GEN_RETRIES:
                 last_exc = e
@@ -3400,6 +3329,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"/gk 或 gk 你的问题 — 对话 ({GROK_MODEL})\n"
             f"/gm 或 gm 你的问题 — 对话 ({GEMINI_MODEL})\n"
             f"/lm 或 lm 你的问题 — 对话 ({LUMO_MODEL})\n"
+            f"/ln 或 ln 你的问题 — 对话 ({LUNA_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
             "/edit 或 edit 要求 — 回复图片改图（或上传图+写 caption）\n"
             "/av 番号 — 查询封面（Fourhoi → R18.dev）；回复图片发 /av，或图片 caption 写 /av 检索番号（AVScan）\n"
@@ -4351,10 +4281,12 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 or raw_lower.startswith("gk ")
                 or raw_lower.startswith("gm ")
                 or raw_lower.startswith("lm ")
+                or raw_lower.startswith("ln ")
                 or raw_lower.startswith("/ds ")
                 or raw_lower.startswith("/gk ")
                 or raw_lower.startswith("/gm ")
                 or raw_lower.startswith("/lm ")
+                or raw_lower.startswith("/ln ")
             )
             and own_image_file_id
         ):
@@ -4408,10 +4340,10 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if edit_file_id:
             source_bytes = await _download_telegram_file(context, edit_file_id)
             image_bytes = await _edit_image(image_prompt, source_bytes)
-            model_name = f"imagefree/{IMAGE_EDIT_MODEL}"
+            model_name = IMAGE_EDIT_MODEL
         else:
             image_bytes = await _generate_image(image_prompt)
-            model_name = f"imagefree/{IMAGE_MODEL}"
+            model_name = IMAGE_MODEL
         caption = f"模型: {model_name}\n提示词: {prompt[:850]}"
         await msg.reply_photo(photo=_photo_file(image_bytes), caption=caption)
         try:
@@ -6180,6 +6112,7 @@ async def post_init(application: Application) -> None:
         BotCommand("gk", f"对话 ({GROK_MODEL})"),
         BotCommand("gm", f"对话 ({GEMINI_MODEL})"),
         BotCommand("lm", f"对话 ({LUMO_MODEL})"),
+        BotCommand("ln", f"对话 ({LUNA_MODEL})"),
         BotCommand("img", "生成图片"),
         BotCommand("edit", "修改图片"),
         BotCommand("av", "番号查 R18.dev 封面；图片检索 AVScan"),
@@ -6267,7 +6200,7 @@ def main() -> None:
     app.add_handler(CommandHandler("vid", video_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("allow", allow_cmd))
-    app.add_handler(CommandHandler(["ds", "gk", "gm", "lm"], ai_cmd))
+    app.add_handler(CommandHandler(["ds", "gk", "gm", "lm", "ln"], ai_cmd))
     app.add_handler(CommandHandler("ip", ip_cmd))
     app.add_handler(CommandHandler("whois", whois_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
