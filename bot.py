@@ -61,6 +61,7 @@ OAI_MODEL = os.getenv("OAI_MODEL", "gpt-5.5").strip()
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
 LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-5.6-luna").strip()
+LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "default").strip().lower()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip().lower()
 # --- 图片生成 (imagefree API, https://imagefree.tingfengai.art) ---
@@ -1357,7 +1358,9 @@ def _is_text_ai_prefix(raw_text: str) -> bool:
         or text.startswith("/gm ")
         or text.startswith("ln ")
         or text.startswith("/ln ")
-        or text in {"ds", "/ds", "gk", "/gk", "gm", "/gm", "ln", "/ln"}
+        or text.startswith("lm ")
+        or text.startswith("/lm ")
+        or text in {"ds", "/ds", "gk", "/gk", "gm", "/gm", "ln", "/ln", "lm", "/lm"}
     )
 
 
@@ -1410,12 +1413,12 @@ def _is_reply_to_this_bot(msg) -> bool:
 def _clean_prompt(raw_text: str) -> str:
     text = raw_text.strip()
     low = text.lower()
-    for prefix in ("/gk ", "gk ", "/ds ", "ds ", "/gm ", "gm ", "/ln ", "ln "):
+    for prefix in ("/gk ", "gk ", "/ds ", "ds ", "/gm ", "gm ", "/ln ", "ln ", "/lm ", "lm "):
         if low.startswith(prefix):
             text = text[len(prefix):].strip()
             break
     else:
-        if low in {"/gk", "gk", "/ds", "ds", "/gm", "gm", "/ln", "ln"}:
+        if low in {"/gk", "gk", "/ds", "ds", "/gm", "gm", "/ln", "ln", "/lm", "lm"}:
             text = ""
     # Strip leading @bot_username mention
     if BOT_USERNAME:
@@ -1451,7 +1454,7 @@ def _inherit_text_model_from_reply(msg) -> Optional[str]:
     if not model_name:
         logger.info("model_inherit: no model line found in replied text")
         return None
-    if model_name in {DS_MODEL, AI_THINKING_MODEL, OAI_MODEL, GROK_MODEL, GEMINI_MODEL, LUNA_MODEL}:
+    if model_name in {DS_MODEL, AI_THINKING_MODEL, OAI_MODEL, GROK_MODEL, GEMINI_MODEL, LUNA_MODEL, LUMO_MODEL}:
         logger.info("model_inherit: inherited model=%s", model_name)
         return model_name
     logger.info("model_inherit: model line found but not allowed model=%s", model_name)
@@ -1466,6 +1469,8 @@ def _select_text_model(raw_text: str, msg=None) -> str:
         return GEMINI_MODEL
     if low.startswith("/ln ") or low.startswith("ln ") or low in {"/ln", "ln"}:
         return LUNA_MODEL
+    if low.startswith("/lm ") or low.startswith("lm ") or low in {"/lm", "lm"}:
+        return LUMO_MODEL
     if low.startswith("/ds ") or low.startswith("ds ") or low in {"/ds", "ds"}:
         return DS_MODEL
     inherited = _inherit_text_model_from_reply(msg) if msg is not None else None
@@ -3394,6 +3399,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"/ds 或 ds 你的问题 — 对话 ({DS_MODEL})\n"
             f"/gk 或 gk 你的问题 — 对话 ({GROK_MODEL})\n"
             f"/gm 或 gm 你的问题 — 对话 ({GEMINI_MODEL})\n"
+            f"/lm 或 lm 你的问题 — 对话 ({LUMO_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
             "/edit 或 edit 要求 — 回复图片改图（或上传图+写 caption）\n"
             "/av 番号 — 查询封面（Fourhoi → R18.dev）；回复图片发 /av，或图片 caption 写 /av 检索番号（AVScan）\n"
@@ -4094,7 +4100,7 @@ def _message_prompt_text(msg) -> str:
 
 
 async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /ds, /gk and /gm commands by forwarding to on_text with prefix restored."""
+    """Handle /ds, /gk, /gm and /lm commands by forwarding to on_text with prefix restored."""
     msg = update.effective_message
     if not msg:
         return
@@ -4344,9 +4350,11 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 raw_lower.startswith("ds ")
                 or raw_lower.startswith("gk ")
                 or raw_lower.startswith("gm ")
+                or raw_lower.startswith("lm ")
                 or raw_lower.startswith("/ds ")
                 or raw_lower.startswith("/gk ")
                 or raw_lower.startswith("/gm ")
+                or raw_lower.startswith("/lm ")
             )
             and own_image_file_id
         ):
@@ -6171,6 +6179,7 @@ async def post_init(application: Application) -> None:
         BotCommand("ds", f"对话 ({DS_MODEL})"),
         BotCommand("gk", f"对话 ({GROK_MODEL})"),
         BotCommand("gm", f"对话 ({GEMINI_MODEL})"),
+        BotCommand("lm", f"对话 ({LUMO_MODEL})"),
         BotCommand("img", "生成图片"),
         BotCommand("edit", "修改图片"),
         BotCommand("av", "番号查 R18.dev 封面；图片检索 AVScan"),
@@ -6258,7 +6267,7 @@ def main() -> None:
     app.add_handler(CommandHandler("vid", video_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("allow", allow_cmd))
-    app.add_handler(CommandHandler(["ds", "gk", "gm"], ai_cmd))
+    app.add_handler(CommandHandler(["ds", "gk", "gm", "lm"], ai_cmd))
     app.add_handler(CommandHandler("ip", ip_cmd))
     app.add_handler(CommandHandler("whois", whois_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))

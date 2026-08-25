@@ -55,6 +55,23 @@ def test_clean_prompt_and_select_text_model_for_gm():
     assert bot._is_text_ai_prefix("gmx 测试") is False
 
 
+def test_clean_prompt_and_select_text_model_for_lm():
+    assert bot.LUMO_MODEL == "lumo-2.0-max"
+    assert bot._clean_prompt("lm 你好") == "你好"
+    assert bot._clean_prompt("/lm 你好") == "你好"
+    assert bot._clean_prompt("lm") == ""
+    assert bot._clean_prompt("/lm") == ""
+    assert bot._select_text_model("lm 你好") == bot.LUMO_MODEL
+    assert bot._select_text_model("/lm 你好") == bot.LUMO_MODEL
+    assert bot._select_text_model("lm") == bot.LUMO_MODEL
+    assert bot._select_text_model("/lm") == bot.LUMO_MODEL
+    assert bot._is_text_ai_prefix("lm 测试") is True
+    assert bot._is_text_ai_prefix("/lm 测试") is True
+    assert bot._is_text_ai_prefix("lm") is True
+    assert bot._is_text_ai_prefix("/lm") is True
+    assert bot._is_text_ai_prefix("lmx 测试") is False
+
+
 def test_image_request_detection_handles_prefixes_and_commands():
     assert bot._is_image_generation_request("img 赛博朋克城市") is True
     assert bot._is_image_generation_request("/img 赛博朋克城市") is True
