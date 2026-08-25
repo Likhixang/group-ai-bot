@@ -60,6 +60,7 @@ AI_THINKING_MODEL = os.getenv("AI_THINKING_MODEL", "ds-4.1-thinking").strip()
 OAI_MODEL = os.getenv("OAI_MODEL", "gpt-5.5").strip()
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
+LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-5.6-luna").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "default").strip().lower()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip().lower()
 # --- 图片生成 (imagefree API, https://imagefree.tingfengai.art) ---
@@ -1354,7 +1355,9 @@ def _is_text_ai_prefix(raw_text: str) -> bool:
         or text.startswith("/gk ")
         or text.startswith("gm ")
         or text.startswith("/gm ")
-        or text in {"ds", "/ds", "gk", "/gk", "gm", "/gm"}
+        or text.startswith("ln ")
+        or text.startswith("/ln ")
+        or text in {"ds", "/ds", "gk", "/gk", "gm", "/gm", "ln", "/ln"}
     )
 
 
@@ -1407,12 +1410,12 @@ def _is_reply_to_this_bot(msg) -> bool:
 def _clean_prompt(raw_text: str) -> str:
     text = raw_text.strip()
     low = text.lower()
-    for prefix in ("/gk ", "gk ", "/ds ", "ds ", "/gm ", "gm "):
+    for prefix in ("/gk ", "gk ", "/ds ", "ds ", "/gm ", "gm ", "/ln ", "ln "):
         if low.startswith(prefix):
             text = text[len(prefix):].strip()
             break
     else:
-        if low in {"/gk", "gk", "/ds", "ds", "/gm", "gm"}:
+        if low in {"/gk", "gk", "/ds", "ds", "/gm", "gm", "/ln", "ln"}:
             text = ""
     # Strip leading @bot_username mention
     if BOT_USERNAME:
@@ -1448,7 +1451,7 @@ def _inherit_text_model_from_reply(msg) -> Optional[str]:
     if not model_name:
         logger.info("model_inherit: no model line found in replied text")
         return None
-    if model_name in {DS_MODEL, AI_THINKING_MODEL, OAI_MODEL, GROK_MODEL, GEMINI_MODEL}:
+    if model_name in {DS_MODEL, AI_THINKING_MODEL, OAI_MODEL, GROK_MODEL, GEMINI_MODEL, LUNA_MODEL}:
         logger.info("model_inherit: inherited model=%s", model_name)
         return model_name
     logger.info("model_inherit: model line found but not allowed model=%s", model_name)
@@ -1461,6 +1464,8 @@ def _select_text_model(raw_text: str, msg=None) -> str:
         return GROK_MODEL
     if low.startswith("/gm ") or low.startswith("gm ") or low in {"/gm", "gm"}:
         return GEMINI_MODEL
+    if low.startswith("/ln ") or low.startswith("ln ") or low in {"/ln", "ln"}:
+        return LUNA_MODEL
     if low.startswith("/ds ") or low.startswith("ds ") or low in {"/ds", "ds"}:
         return DS_MODEL
     inherited = _inherit_text_model_from_reply(msg) if msg is not None else None
