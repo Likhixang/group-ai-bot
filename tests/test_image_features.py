@@ -101,13 +101,6 @@ def test_user_uploaded_photo_with_edit_caption_is_image_edit_target():
     assert bot._message_image_target(msg) == "large"
 
 
-def test_image_prompt_web_search_decision_for_current_or_specific_subjects():
-    assert bot._should_web_search_image_prompt("img 画一下最新的 Tesla Roadster 外观") is True
-    assert bot._should_web_search_image_prompt("img 画一张 iPhone 18 发布会海报") is True
-    assert bot._should_web_search_image_prompt("img 画一只白猫在月光下喝茶") is False
-    assert bot._should_web_search_image_prompt("img 梵高风格的向日葵") is False
-
-
 def test_av_cover_parsing_and_r18dev_dmm_allow_list(monkeypatch):
     monkeypatch.setattr(bot, "BOT_USERNAME", "any_bot")
 
@@ -393,12 +386,3 @@ def test_plain_av_image_caption_stays_on_avscan_path(monkeypatch):
     assert calls["upload"] == [b"upload"]
     assert calls["edits"] == [("result", {"parse_mode": bot.ParseMode.HTML, "disable_web_page_preview": True})]
     assert calls["cleanup"] == [(-100123, [100, 100, 101])]
-
-
-def test_enrich_image_prompt_with_web_context_includes_real_search_data():
-    prompt = "画最新的 Tesla Roadster"
-    web_context = "WEB_SEARCH_CONTEXT\nResult 1:\nTitle: Tesla Roadster 2026\nURL: https://example.com\nContent: updated body shape and LED strip"
-    enriched = bot._enrich_image_prompt_with_web_context(prompt, web_context)
-    assert prompt in enriched
-    assert "updated body shape" in enriched
-    assert "真实参考资料" in enriched

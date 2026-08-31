@@ -2168,39 +2168,6 @@ def _should_web_search(prompt: str) -> bool:
     return any(trigger in text for trigger in WEB_SEARCH_TRIGGERS)
 
 
-IMAGE_WEB_SEARCH_TRIGGERS = (
-    "最新", "新闻", "今天", "现在", "最近", "当前", "现任", "刚发布",
-    "发布会", "新款", "新版", "2025", "2026", "2027", "2028", "2029",
-    "latest", "recent", "current", "news", "new", "released", "launch",
-)
-
-
-def _should_web_search_image_prompt(prompt: str) -> bool:
-    text = _clean_image_prompt(prompt or "")
-    low = text.lower()
-    if not low:
-        return False
-    if any(trigger in low for trigger in IMAGE_WEB_SEARCH_TRIGGERS):
-        return True
-    # Product/model names often require current visual references, e.g. iPhone 18.
-    if re.search(r"\b[a-z][a-z0-9-]{1,}\s*(?:\d{2,}|[ivx]{2,})\b", low, re.IGNORECASE):
-        return True
-    return False
-
-
-def _enrich_image_prompt_with_web_context(prompt: str, web_context: Optional[str]) -> str:
-    cleaned = (prompt or "").strip()
-    context_text = (web_context or "").strip()
-    if not context_text:
-        return cleaned
-    return (
-        f"{cleaned}\n\n"
-        "真实参考资料如下。生成图片时请只把这些资料作为视觉参考，"
-        "不要在画面中加入资料来源、URL、水印或解释文字。\n"
-        f"{context_text[:3500]}"
-    ).strip()
-
-
 async def _fetch_models_dev_models() -> dict:
     """Fetch provider-agnostic model metadata from models.dev with a short cache."""
     global _MODELS_DEV_CACHE
@@ -4301,29 +4268,6 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     image_prompt = prompt
-    if _should_web_search_image_prompt(prompt):
-        try:
-            search_status = await _reply_text_and_track(msg, "先查资料，再画图...")
-            web_results = await _web_search(prompt, WEB_SEARCH_MAX_RESULTS)
-            web_results = await _fetch_web_result_contents(web_results, WEB_FETCH_MAX_RESULTS)
-            web_context = _format_web_search_context(prompt, web_results)
-            image_prompt = _enrich_image_prompt_with_web_context(prompt, web_context)
-            fetched_count = sum(1 for item in web_results if item.get("content"))
-            logger.info(
-                "image_web_search: query=%r results=%s fetched=%s",
-                prompt[:120],
-                len(web_results),
-                fetched_count,
-            )
-            try:
-                await context.bot.delete_message(
-                    chat_id=search_status.chat_id,
-                    message_id=search_status.message_id,
-                )
-            except Exception:
-                pass
-        except Exception:
-            logger.exception("image web_search failed; continuing with original prompt")
 
     edit_file_id = None
     if is_edit:
