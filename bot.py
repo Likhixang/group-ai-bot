@@ -2610,6 +2610,17 @@ async def _generate_image(prompt: str) -> bytes:
             raise
 
 
+# 图生图编辑引导语：AxonHub 走 /images/generations + image 字段（图生图重画），
+# 不是标准 /images/edits 编辑。在提示词前加强调引导，尽量让模型保留原图
+# 构图/主体/背景，只改用户要求的部分。
+IMAGE_EDIT_GUIDE = (
+    "请基于用户提供的原图进行编辑修改，"
+    "严格保持原图的构图、主体、人物、背景和整体风格不变，"
+    "只根据用户的要求改动对应的部分，不要重新绘制整张图片。\n"
+    "用户修改要求："
+)
+
+
 async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
     base = AI_BASE_URL.rstrip("/")
     headers = {"Authorization": f"Bearer {AI_API_KEY}"}
@@ -2618,7 +2629,7 @@ async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
     img_b64 = base64.b64encode(image_bytes).decode()
     payload = {
         "model": IMAGE_EDIT_MODEL,
-        "prompt": prompt,
+        "prompt": IMAGE_EDIT_GUIDE + (prompt or ""),
         "image": img_b64,
         "n": 1,
         "size": "1024x1024",
