@@ -62,7 +62,7 @@ GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
 LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-5.6-luna").strip()
 LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "agnes-image-2.1-flash").strip()
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
 # --- 图片生成 (AxonHub /v1/images/generations，OpenAI 兼容) ---
 # 文生图：POST {AI_BASE_URL}/images/generations
