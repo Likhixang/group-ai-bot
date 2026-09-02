@@ -39,7 +39,7 @@ def test_clean_prompt_and_select_text_model_for_ds_and_gk():
 
 
 def test_clean_prompt_and_select_text_model_for_gm():
-    assert bot.GEMINI_MODEL == "gemini-3.7-flash"
+    assert bot.GEMINI_MODEL == "gemini-3.8-flash"
     assert bot._clean_prompt("gm 你好") == "你好"
     assert bot._clean_prompt("/gm 你好") == "你好"
     assert bot._clean_prompt("gm") == ""
