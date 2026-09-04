@@ -2626,7 +2626,8 @@ async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
     headers = {"Authorization": f"Bearer {AI_API_KEY}"}
     if len(image_bytes) > 4 * 1024 * 1024:
         image_bytes = _prepare_avscan_image(image_bytes)
-    img_b64 = base64.b64encode(image_bytes).decode()
+    mime = "image/png" if image_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+    img_b64 = "data:" + mime + ";base64," + base64.b64encode(image_bytes).decode()
     payload = {
         "model": IMAGE_EDIT_MODEL,
         "prompt": IMAGE_EDIT_GUIDE + (prompt or ""),
