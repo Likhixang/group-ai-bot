@@ -5922,14 +5922,40 @@ DC_LOCATIONS = {
 }
 
 
+def _rle_decode(data: bytes) -> bytes:
+    """Telegram file_id 的 RLE 解码：0x00 后接重复次数。"""
+    if not data:
+        return data
+    new = b''
+    last = b''
+    for cur in data:
+        if last == b'\0':
+            new += last * cur
+            last = b''
+        else:
+            new += last
+            last = bytes([cur])
+    return new + last
+
+
 def _dc_from_file_id(file_id: str) -> Optional[int]:
-    """从 Telegram file_id (base64url) 解码数据中心编号；失败返回 None。"""
+    """从 Telegram file_id 解码数据中心编号；失败返回 None。
+
+    格式：base64url + RLE 解码后，末尾字节为 major version；
+    正文前 8 字节为 <i type, i dc_id>（小端）。
+    """
     try:
-        data = base64.urlsafe_b64decode(file_id + "==")
-        if len(data) >= 8:
-            dc = int.from_bytes(data[4:8], "little")
-            if 1 <= dc <= 5:
-                return dc
+        raw = base64.urlsafe_b64decode(file_id + "=" * (len(file_id) % 4))
+        data = _rle_decode(raw)
+        if len(data) < 9:
+            return None
+        major = data[-1]
+        body = data[:-2] if major >= 4 else data[:-1]
+        if len(body) < 8:
+            return None
+        dc = int.from_bytes(body[4:8], "little")
+        if 1 <= dc <= 5:
+            return dc
     except Exception:
         pass
     return None
