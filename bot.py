@@ -3316,7 +3316,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "  回复图片或上传图片写 /vid 描述 — 图生视频\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
             "/ip IP地址 — 查 IP 纯净度评分（多源聚合）\n"
-            "/dc — 查询你的 Telegram 账号所在数据中心 (DC)\n"
+            "/dc — 查询 Telegram 账号所在 DC（回复他人消息可查对方）\n"
             "/whois 域名 — 查域名 WHOIS 信息（注册商/时间/NS/状态）\n"
             "/ping 域名 — 从全球节点测延迟（支持指定 DNS/地区）\n"
             "/http URL — 从全球节点 HTTP 测速（支持指定地区）\n"
@@ -5935,8 +5935,37 @@ def _dc_from_file_id(file_id: str) -> Optional[int]:
     return None
 
 
+# 用户自己上传的媒体类型（排除 sticker/animation 等公共库文件，其 file_id 不反映账号 DC）
+_MEDIA_ATTRS = ("photo", "document", "video", "voice", "video_note", "audio")
+
+
+def _media_file_id(message) -> Optional[str]:
+    """从消息中提取用户上传媒体的 file_id；photo 取最大尺寸。"""
+    for attr in _MEDIA_ATTRS:
+        media = getattr(message, attr, None)
+        if media:
+            if attr == "photo":
+                return media[-1].file_id
+            return media.file_id
+    return None
+
+
+# 运行期被动收集：user_id -> 该用户最近一次发送的媒体 file_id（/dc 无头像兜底）
+_USER_MEDIA_FILE_IDS: dict[int, str] = {}
+
+
+async def _track_media_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """低开销钩子：记录每个用户最近发送的媒体 file_id，供 /dc 无头像时判定 DC。"""
+    msg = update.effective_message
+    if not msg or not msg.from_user or msg.from_user.is_bot:
+        return
+    fid = _media_file_id(msg)
+    if fid:
+        _USER_MEDIA_FILE_IDS[msg.from_user.id] = fid
+
+
 async def dc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """查询发命令者的 Telegram 账号所在数据中心 (DC)。"""
+    """查询 Telegram 账号所在数据中心 (DC)。直接发 /dc 查自己；回复他人消息发 /dc 查对方。"""
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
@@ -5950,21 +5979,56 @@ async def dc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _reply_not_allowed_and_cleanup(msg, context)
             return
 
-    user = msg.from_user
-    if not user:
+    commander = msg.from_user
+    if not commander:
         return
+    # 回复他人消息发 /dc → 查被回复者；否则查发命令者自己
+    target = commander
+    replied = msg.reply_to_message
+    if replied and replied.from_user:
+        target = replied.from_user
+
     try:
-        photos = await context.bot.get_user_profile_photos(user.id, limit=1)
+        photos = await context.bot.get_user_profile_photos(target.id, limit=1)
     except Exception as e:
-        logger.exception("dc_cmd: get_user_profile_photos failed for %s", user.id)
+        logger.exception("dc_cmd: get_user_profile_photos failed for %s", target.id)
         await _reply_and_cleanup(msg, context, f"❌ 查询失败: {e}", NOTICE_DELETE_TTL)
         return
     if not photos.photos:
+        # 无头像 → 依次尝试：命令回复的媒体（须为目标所发）→ 运行期被动缓存
+
+        async def _report(dc: int, source: str) -> None:
+            location = DC_LOCATIONS.get(dc, "未知位置")
+            name = escape(target.full_name or target.username or str(target.id))
+            await _reply_and_cleanup(
+                msg,
+                context,
+                f"🗄️ <b>{name}</b> 的 Telegram 账号位于 <b>DC{dc}</b> ({location})\n"
+                f"（依据：{source}）",
+                NOTICE_DELETE_TTL,
+                parse_mode=ParseMode.HTML,
+            )
+
+        if replied and replied.from_user and replied.from_user.id == target.id:
+            fid = _media_file_id(replied)
+            if fid:
+                dc = _dc_from_file_id(fid)
+                if dc is not None:
+                    await _report(dc, "回复消息中的媒体文件")
+                    return
+
+        fid = _USER_MEDIA_FILE_IDS.get(target.id)
+        if fid:
+            dc = _dc_from_file_id(fid)
+            if dc is not None:
+                await _report(dc, "此前发送的媒体文件")
+                return
+
         await _reply_and_cleanup(
             msg,
             context,
-            "🔍 无法确定 DC：对方没有公开头像或头像对机器人不可见"
-            "（Telegram 通过头像 file_id 编码 DC 信息）。",
+            "🔍 未找到可用于检测的公开头像或历史媒体文件。\n"
+            "请先上传任意文件/图片，然后再次发送 /dc 检测。",
             NOTICE_DELETE_TTL,
         )
         return
@@ -5981,7 +6045,7 @@ async def dc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     location = DC_LOCATIONS.get(dc, "未知位置")
-    name = escape(user.full_name or user.username or str(user.id))
+    name = escape(target.full_name or target.username or str(target.id))
     await _reply_and_cleanup(
         msg,
         context,
@@ -6165,7 +6229,7 @@ async def post_init(application: Application) -> None:
         BotCommand("unpin", "取消置顶并停用每日自动置顶（仅超管）"),
         BotCommand("start", "启动说明"),
         BotCommand("ip", "查 IP 纯净度评分"),
-        BotCommand("dc", "查你的 Telegram 账号所在数据中心 (DC)"),
+        BotCommand("dc", "查 Telegram 账号所在 DC；回复他人消息可查对方"),
         BotCommand("whois", "查域名 WHOIS 信息"),
         BotCommand("ping", "ping 测试域名延迟"),
         BotCommand("http", "从全球节点 HTTP 测速"),
@@ -6244,6 +6308,11 @@ def main() -> None:
     app.add_handler(CommandHandler("http", http_cmd))
     app.add_handler(CommandHandler("context", context_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    # group=-4: 最先执行，被动记录用户媒体 file_id（/dc 无头像兜底）
+    app.add_handler(
+        MessageHandler(~filters.StatusUpdate.ALL, _track_media_file_id),
+        group=-4,
+    )
     # group=-3: linux.do 链接检测（最先执行，超管豁免；优先于 soft ban 删消息）
     app.add_handler(
         MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, enforce_linux_do_rule),
