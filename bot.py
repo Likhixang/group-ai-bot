@@ -4938,13 +4938,12 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
 
-# linux.do 链接检测：匹配 https://linux.do、linux.do/、https://www.linux.do、www.linux.do/
-# 等变体（协议与 www 可选；负向前瞻防止 linux.do.evil.com / linuxdo.com 误匹配）
-_LINUX_DO_URL_RE = re.compile(r"(?:https?://)?(?:www\.)?linux\.do(?![a-z0-9.-])", re.IGNORECASE)
+# 链接检测：全群禁发任何 http(s) 链接，匹配 URL_PATTERN（协议必需）。
+# 生效规则见 enforce_link_rule。
 
 
-async def enforce_linux_do_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """全群禁发 linux.do 链接：撤回消息并 @ 警告（超管豁免），警告随全局 NOTICE_DELETE_TTL 删除。"""
+async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """全群禁发任意链接：撤回消息并 @ 警告（超管豁免），警告随全局 NOTICE_DELETE_TTL 删除。"""
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
@@ -4962,21 +4961,21 @@ async def enforce_linux_do_rule(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     text = msg.text or msg.caption or ""
-    if not _LINUX_DO_URL_RE.search(text):
+    if not URL_PATTERN.search(text):
         return
 
     # 1. 立即撤回违规消息
     try:
         await context.bot.delete_message(chat_id=chat.id, message_id=msg.message_id)
         logger.info(
-            "linux_do_rule: deleted chat=%s user=%s msg=%s",
+            "link_rule: deleted chat=%s user=%s msg=%s",
             chat.id,
             user.id,
             msg.message_id,
         )
     except Exception:
         logger.warning(
-            "linux_do_rule: delete failed chat=%s user=%s msg=%s",
+            "link_rule: delete failed chat=%s user=%s msg=%s",
             chat.id,
             user.id,
             getattr(msg, "message_id", None),
@@ -4986,7 +4985,7 @@ async def enforce_linux_do_rule(update: Update, context: ContextTypes.DEFAULT_TY
     # 2. @ 警告，随全局消息删除时间自动删除
     display = _user_display_name(user, fallback_id=user.id)
     mention = _html_user_mention(user.id, display)
-    notice = f"⚠️ {mention} 再搬屎找人弄你！🖕"
+    notice = f"⚠️ {mention} 群内禁止发链接！🖕"
     try:
         sent = await context.bot.send_message(
             chat_id=chat.id,
@@ -4997,7 +4996,7 @@ async def enforce_linux_do_rule(update: Update, context: ContextTypes.DEFAULT_TY
         _schedule_delete_messages(context, chat.id, [sent.message_id], NOTICE_DELETE_TTL)
     except Exception:
         logger.warning(
-            "linux_do_rule: notice failed chat=%s user=%s",
+            "link_rule: notice failed chat=%s user=%s",
             chat.id,
             user.id,
             exc_info=True,
@@ -6339,9 +6338,9 @@ def main() -> None:
         MessageHandler(~filters.StatusUpdate.ALL, _track_media_file_id),
         group=-4,
     )
-    # group=-3: linux.do 链接检测（最先执行，超管豁免；优先于 soft ban 删消息）
+    # group=-3: 任意链接检测（最先执行，超管豁免；优先于 soft ban 删消息）
     app.add_handler(
-        MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, enforce_linux_do_rule),
+        MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, enforce_link_rule),
         group=-3,
     )
     # group=-2: soft ban 删消息（优先）
