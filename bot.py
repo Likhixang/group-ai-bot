@@ -3316,6 +3316,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "  回复图片或上传图片写 /vid 描述 — 图生视频\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
             "/ip IP地址 — 查 IP 纯净度评分（多源聚合）\n"
+            "/dc — 查询你的 Telegram 账号所在数据中心 (DC)\n"
             "/whois 域名 — 查域名 WHOIS 信息（注册商/时间/NS/状态）\n"
             "/ping 域名 — 从全球节点测延迟（支持指定 DNS/地区）\n"
             "/http URL — 从全球节点 HTTP 测速（支持指定地区）\n"
@@ -5912,6 +5913,84 @@ async def http_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _auto_delete_after(msg, sent, context)
 
 
+DC_LOCATIONS = {
+    1: "Miami, USA",
+    2: "Amsterdam, NL",
+    3: "Miami, USA",
+    4: "Amsterdam, NL",
+    5: "Singapore, SG",
+}
+
+
+def _dc_from_file_id(file_id: str) -> Optional[int]:
+    """从 Telegram file_id (base64url) 解码数据中心编号；失败返回 None。"""
+    try:
+        data = base64.urlsafe_b64decode(file_id + "==")
+        if len(data) >= 8:
+            dc = int.from_bytes(data[4:8], "little")
+            if 1 <= dc <= 5:
+                return dc
+    except Exception:
+        pass
+    return None
+
+
+async def dc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """查询发命令者的 Telegram 账号所在数据中心 (DC)。"""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    uid = msg.from_user.id if msg.from_user else None
+    if not _is_private_super_admin(chat, uid):
+        if not _is_allowed_chat(chat):
+            await _reply_not_allowed_and_cleanup(msg, context)
+            return
+        if not _is_allowed_topic(msg):
+            await _reply_not_allowed_and_cleanup(msg, context)
+            return
+
+    user = msg.from_user
+    if not user:
+        return
+    try:
+        photos = await context.bot.get_user_profile_photos(user.id, limit=1)
+    except Exception as e:
+        logger.exception("dc_cmd: get_user_profile_photos failed for %s", user.id)
+        await _reply_and_cleanup(msg, context, f"❌ 查询失败: {e}", NOTICE_DELETE_TTL)
+        return
+    if not photos.photos:
+        await _reply_and_cleanup(
+            msg,
+            context,
+            "🔍 无法确定 DC：对方没有公开头像或头像对机器人不可见"
+            "（Telegram 通过头像 file_id 编码 DC 信息）。",
+            NOTICE_DELETE_TTL,
+        )
+        return
+
+    file_id = photos.photos[0][-1].file_id
+    dc = _dc_from_file_id(file_id)
+    if dc is None:
+        await _reply_and_cleanup(
+            msg,
+            context,
+            "🔍 无法解析头像 file_id，无法确定 DC。",
+            NOTICE_DELETE_TTL,
+        )
+        return
+
+    location = DC_LOCATIONS.get(dc, "未知位置")
+    name = escape(user.full_name or user.username or str(user.id))
+    await _reply_and_cleanup(
+        msg,
+        context,
+        f"🗄️ <b>{name}</b> 的 Telegram 账号位于 <b>DC{dc}</b> ({location})",
+        NOTICE_DELETE_TTL,
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def ip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """查 IP 纯净度。用法：/ip <IP地址>"""
     msg = update.effective_message
@@ -6086,6 +6165,7 @@ async def post_init(application: Application) -> None:
         BotCommand("unpin", "取消置顶并停用每日自动置顶（仅超管）"),
         BotCommand("start", "启动说明"),
         BotCommand("ip", "查 IP 纯净度评分"),
+        BotCommand("dc", "查你的 Telegram 账号所在数据中心 (DC)"),
         BotCommand("whois", "查域名 WHOIS 信息"),
         BotCommand("ping", "ping 测试域名延迟"),
         BotCommand("http", "从全球节点 HTTP 测速"),
@@ -6158,6 +6238,7 @@ def main() -> None:
     app.add_handler(CommandHandler("allow", allow_cmd))
     app.add_handler(CommandHandler(["ds", "gk", "gm", "lm", "ln"], ai_cmd))
     app.add_handler(CommandHandler("ip", ip_cmd))
+    app.add_handler(CommandHandler("dc", dc_cmd))
     app.add_handler(CommandHandler("whois", whois_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("http", http_cmd))
