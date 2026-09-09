@@ -5005,6 +5005,42 @@ def _extract_first_link_from_message(msg: Message) -> Optional[str]:
     return None
 
 
+def _format_luna_link_review(raw_review: str) -> str:
+    """Format Luna review output with Telegram blockquote for the shit content line."""
+    text = (raw_review or "").strip()
+    if not text:
+        return "<blockquote>💩 含屎量：100%</blockquote>"
+
+    # Search for 含屎量 line
+    m = re.search(r"含屎量[：:]\s*(\d+(?:\.\d+)?%?)", text)
+    if m:
+        crap_val = m.group(1).strip()
+        if not crap_val.endswith("%"):
+            crap_val += "%"
+        shit_line = f"💩 含屎量：{crap_val}"
+    else:
+        # Fallback if Luna didn't strictly format it
+        shit_line = "💩 含屎量：未知（未能解析具体数值）"
+
+    # Remove any standalone gold / shit lines from the summary body
+    cleaned_lines = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if re.search(r"^(?:[-*•]\s*)?含金量[：:]", stripped):
+            continue
+        if re.search(r"^(?:[-*•]\s*)?含屎量[：:]", stripped):
+            continue
+        cleaned_lines.append(line)
+
+    summary_body = "\n".join(cleaned_lines).strip()
+    safe_body = escape(summary_body)
+    safe_shit_line = escape(shit_line)
+
+    if safe_body:
+        return f"{safe_body}\n\n<blockquote>{safe_shit_line}</blockquote>"
+    return f"<blockquote>{safe_shit_line}</blockquote>"
+
+
 async def _review_link_content_with_luna(url: str) -> str:
     """Fetch URL content via reader and call Luna to evaluate summary and gold/crap percentage."""
     content = ""
@@ -5016,26 +5052,26 @@ async def _review_link_content_with_luna(url: str) -> str:
     prompt_content = content[:WEB_FETCH_MAX_CHARS] if content else f"链接：{url}（无法直接抓取网页正文，请根据链接特征与已知信息进行审评）"
 
     prompt = (
-        f"请审评以下网页/链接内容并给出客观评价：\n\n"
+        f"群友在群里分享了一个链接，请你来审评并吐槽/评价一下：\n\n"
         f"目标链接: {url}\n"
         f"网页内容提要:\n{prompt_content}\n\n"
-        f"请严格按以下要求输出：\n"
-        f"1. 用简明扼要的中文总结该链接的核心内容并做出客观评价（100-250字左右）。\n"
-        f"2. 在总结最后，单独给出含金量和含屎量评价，格式必须为：\n"
-        f"含金量：X%\n"
-        f"含屎量：Y%\n"
-        f"（注意：含金量与含屎量之和必须为 100%，即 含屎量 = 100% - 含金量）。"
+        f"要求：\n"
+        f"1. 拒绝机械、公文式的无情AI摘要！请用自然、生动、接地气且拟人化的语气（带点调侃、犀利或幽默的群友/老司机视角），聊聊这篇内容到底讲了啥、值不值得看（80-200字左右）。\n"
+        f"2. 在最后，只评价一个指标——「含屎量」（垃圾程度、标题党程度、营销割韭菜程度、废话程度等），不要输出含金量！\n"
+        f"3. 最后单独一行输出含屎量数值，格式必须严格为：\n"
+        f"含屎量：X%\n"
+        f"（注意：X 为 0 到 100 之间的数值，不要在末尾写含金量）。"
     )
 
     messages = [
         {
             "role": "system",
-            "content": "你是 Luna，一个敏锐、犀利且客观的内容审评助手。你需要总结群友分享的链接内容，并客观评估其质量价值（含金量）与垃圾/营销/低质程度（含屎量）。",
+            "content": "你是 Luna，一个说话风趣、犀利毒舌又见多识广的群聊助理。你熟悉互联网各种套路，对群友分享的网页内容能一针见血地点出要害，给出拟人化、接地气的锐评，并量化评估其「含屎量」（低质/标题党/割韭菜/信息垃圾程度）。",
         },
         {"role": "user", "content": prompt},
     ]
 
-    return await _ask_ai_once(messages, model_name=LUNA_MODEL, temperature=0.3)
+    return await _ask_ai_once(messages, model_name=LUNA_MODEL, temperature=0.6)
 
 
 async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5076,14 +5112,19 @@ async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
     try:
-        evaluation = await _review_link_content_with_luna(url)
-        if not evaluation or not evaluation.strip():
-            evaluation = "未能成功获取评析内容。"
+        raw_evaluation = await _review_link_content_with_luna(url)
+        formatted_eval = _format_luna_link_review(raw_evaluation)
 
         if status_msg:
-            await status_msg.edit_text(evaluation.strip())
+            try:
+                await status_msg.edit_text(formatted_eval, parse_mode=ParseMode.HTML)
+            except Exception:
+                await status_msg.edit_text(raw_evaluation.strip())
         else:
-            await msg.reply_text(evaluation.strip())
+            try:
+                await msg.reply_text(formatted_eval, parse_mode=ParseMode.HTML)
+            except Exception:
+                await msg.reply_text(raw_evaluation.strip())
     except Exception:
         logger.warning(
             "link_rule: Luna review failed chat=%s user=%s msg=%s",
@@ -5092,12 +5133,12 @@ async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             msg.message_id,
             exc_info=True,
         )
-        fallback_text = "含屎量未经核实，审慎品鉴"
+        fallback_text = "<blockquote>💩 含屎量未经核实，审慎品鉴</blockquote>"
         try:
             if status_msg:
-                await status_msg.edit_text(fallback_text)
+                await status_msg.edit_text(fallback_text, parse_mode=ParseMode.HTML)
             else:
-                await msg.reply_text(fallback_text)
+                await msg.reply_text(fallback_text, parse_mode=ParseMode.HTML)
         except Exception:
             pass
 

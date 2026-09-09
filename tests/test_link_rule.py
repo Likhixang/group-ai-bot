@@ -111,13 +111,16 @@ async def test_enforce_link_rule_replies_without_deleting():
     try:
         bot._is_allowed_chat = lambda c: True
         bot._is_soft_ban_protected_user = lambda uid: False
-        bot._review_link_content_with_luna = AsyncMock(return_value="总结：这是一个电报群链接。\n含金量：80%\n含屎量：20%")
+        bot._review_link_content_with_luna = AsyncMock(return_value="这篇文章其实就是老生常谈的吹水水文，没什么营养。\n含屎量：75%")
 
         await bot.enforce_link_rule(update, context)
 
         context.bot.delete_message.assert_not_called()
         msg.reply_text.assert_awaited_once_with("🔍 Luna 正在审评该链接内容...")
-        status_msg.edit_text.assert_awaited_once_with("总结：这是一个电报群链接。\n含金量：80%\n含屎量：20%")
+        status_msg.edit_text.assert_awaited_once_with(
+            "这篇文章其实就是老生常谈的吹水水文，没什么营养。\n\n<blockquote>💩 含屎量：75%</blockquote>",
+            parse_mode=bot.ParseMode.HTML,
+        )
     finally:
         bot._is_allowed_chat = orig_allowed
         bot._is_soft_ban_protected_user = orig_protected
