@@ -21,10 +21,11 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    Message,
     MessageEntity,
     Update,
 )
-from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, MessageEntityType, ParseMode
 from telegram.error import BadRequest, TimedOut
 from telegram.ext import (
     Application,
@@ -4938,12 +4939,107 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
 
-# 链接检测：全群禁发任何 http(s) 链接，匹配 URL_PATTERN（协议必需）。
+# 链接检测：检测消息中是否包含任意 URL 或富文本超链接（包含实体 entities/caption_entities 及正则兜底）。
 # 生效规则见 enforce_link_rule。
 
 
+def _message_contains_link(msg: Message) -> bool:
+    """Check if message contains links via Telegram entities or fallback URL pattern."""
+    if not msg:
+        return False
+
+    # Check text entities
+    for ent in (msg.entities or ()):
+        if ent.type in (MessageEntityType.URL, MessageEntityType.TEXT_LINK):
+            return True
+        if getattr(ent, "url", None):
+            return True
+
+    # Check caption entities (media messages)
+    for ent in (msg.caption_entities or ()):
+        if ent.type in (MessageEntityType.URL, MessageEntityType.TEXT_LINK):
+            return True
+        if getattr(ent, "url", None):
+            return True
+
+    # Fallback to URL_PATTERN regex check on raw text or caption
+    text = msg.text or msg.caption or ""
+    if text and URL_PATTERN.search(text):
+        return True
+
+    return False
+
+
+def _extract_first_link_from_message(msg: Message) -> Optional[str]:
+    """Extract first link URL from message entities or fallback text regex."""
+    if not msg:
+        return None
+
+    # Text entities
+    text = msg.text or ""
+    for ent in (msg.entities or ()):
+        if ent.type == MessageEntityType.TEXT_LINK and getattr(ent, "url", None):
+            return ent.url
+        if ent.type == MessageEntityType.URL:
+            extracted = text[ent.offset : ent.offset + ent.length]
+            if extracted:
+                return extracted
+
+    # Caption entities
+    caption = msg.caption or ""
+    for ent in (msg.caption_entities or ()):
+        if ent.type == MessageEntityType.TEXT_LINK and getattr(ent, "url", None):
+            return ent.url
+        if ent.type == MessageEntityType.URL:
+            extracted = caption[ent.offset : ent.offset + ent.length]
+            if extracted:
+                return extracted
+
+    # Regex fallback
+    full_text = text or caption
+    if full_text:
+        m = URL_PATTERN.search(full_text)
+        if m:
+            return m.group(0)
+
+    return None
+
+
+async def _review_link_content_with_luna(url: str) -> str:
+    """Fetch URL content via reader and call Luna to evaluate summary and gold/crap percentage."""
+    content = ""
+    try:
+        content = await _fetch_url_readable(url)
+    except Exception as exc:
+        logger.warning("Failed to fetch link content for %s: %s", url, exc)
+
+    prompt_content = content[:WEB_FETCH_MAX_CHARS] if content else f"链接：{url}（无法直接抓取网页正文，请根据链接特征与已知信息进行审评）"
+
+    prompt = (
+        f"请审评以下网页/链接内容并给出客观评价：\n\n"
+        f"目标链接: {url}\n"
+        f"网页内容提要:\n{prompt_content}\n\n"
+        f"请严格按以下要求输出：\n"
+        f"1. 用简明扼要的中文总结该链接的核心内容并做出客观评价（100-250字左右）。\n"
+        f"2. 在总结最后，单独给出含金量和含屎量评价，格式必须为：\n"
+        f"含金量：X%\n"
+        f"含屎量：Y%\n"
+        f"（注意：含金量与含屎量之和必须为 100%，即 含屎量 = 100% - 含金量）。"
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": "你是 Luna，一个敏锐、犀利且客观的内容审评助手。你需要总结群友分享的链接内容，并客观评估其质量价值（含金量）与垃圾/营销/低质程度（含屎量）。",
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    return await _ask_ai_once(messages, model_name=LUNA_MODEL, temperature=0.3)
+
+
 async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """全群禁发任意链接：撤回消息并 @ 警告（超管豁免），警告随全局 NOTICE_DELETE_TTL 删除。"""
+    """全群链接检测：调用 Luna 评价链接内容并总结输出含金量与含屎量（超管豁免）。"""
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
@@ -4960,47 +5056,50 @@ async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if _is_soft_ban_protected_user(user.id):
         return
 
-    text = msg.text or msg.caption or ""
-    if not URL_PATTERN.search(text):
+    if not _message_contains_link(msg):
         return
 
-    # 1. 立即撤回违规消息
+    url = _extract_first_link_from_message(msg) or _extract_first_url(msg.text or msg.caption or "")
+    if not url:
+        return
+
+    status_msg = None
     try:
-        await context.bot.delete_message(chat_id=chat.id, message_id=msg.message_id)
-        logger.info(
-            "link_rule: deleted chat=%s user=%s msg=%s",
+        status_msg = await msg.reply_text("🔍 Luna 正在审评该链接内容...")
+    except Exception:
+        logger.warning(
+            "link_rule: initial reply failed chat=%s user=%s msg=%s",
             chat.id,
             user.id,
             msg.message_id,
-        )
-    except Exception:
-        logger.warning(
-            "link_rule: delete failed chat=%s user=%s msg=%s",
-            chat.id,
-            user.id,
-            getattr(msg, "message_id", None),
             exc_info=True,
         )
 
-    # 2. @ 警告，随全局消息删除时间自动删除
-    display = _user_display_name(user, fallback_id=user.id)
-    mention = _html_user_mention(user.id, display)
-    notice = f"⚠️ {mention} 群内禁止发链接！🖕"
     try:
-        sent = await context.bot.send_message(
-            chat_id=chat.id,
-            text=notice,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        _schedule_delete_messages(context, chat.id, [sent.message_id], NOTICE_DELETE_TTL)
+        evaluation = await _review_link_content_with_luna(url)
+        if not evaluation or not evaluation.strip():
+            evaluation = "未能成功获取评析内容。"
+
+        if status_msg:
+            await status_msg.edit_text(evaluation.strip())
+        else:
+            await msg.reply_text(evaluation.strip())
     except Exception:
         logger.warning(
-            "link_rule: notice failed chat=%s user=%s",
+            "link_rule: Luna review failed chat=%s user=%s msg=%s",
             chat.id,
             user.id,
+            msg.message_id,
             exc_info=True,
         )
+        fallback_text = "含屎量未经核实，审慎品鉴"
+        try:
+            if status_msg:
+                await status_msg.edit_text(fallback_text)
+            else:
+                await msg.reply_text(fallback_text)
+        except Exception:
+            pass
 
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
