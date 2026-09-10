@@ -4179,6 +4179,8 @@ async def _av_cover_cmd(
             photo=_r18dev_cover_file(image_bytes),
             caption=_format_av_cover_caption(dvd_id, title, source_label),
             parse_mode=ParseMode.HTML,
+            read_timeout=60,
+            write_timeout=60,
         )
         logger.info(
             "av_cover_complete: chat=%s msg=%s source=%s cover_bytes=%s",
@@ -4199,6 +4201,15 @@ async def _av_cover_cmd(
     except R18DevRateLimitedError:
         logger.warning("r18dev rate limited: chat=%s msg=%s", chat.id, msg.message_id)
         await status.edit_text("⏳ R18.dev 当前请求过多，请稍后再试。")
+    except TimedOut:
+        # The photo POST may still have been delivered by Telegram despite the
+        # client giving up (slow upload of a ~200KB cover). Never claim a hard
+        # failure — the user likely already sees the cover arrive.
+        logger.warning("cover reply timed out (photo may still be delivered): chat=%s msg=%s", chat.id, msg.message_id)
+        try:
+            await status.edit_text("⏳ 封面上传耗时较长，如未收到图片请稍等片刻。")
+        except Exception:
+            logger.exception("cover timeout reply edit failed: chat=%s msg=%s", chat.id, msg.message_id)
     except Exception as exc:
         logger.warning(
             "cover lookup failed: chat=%s msg=%s error=%s",
