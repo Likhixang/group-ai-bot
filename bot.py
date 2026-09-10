@@ -4328,6 +4328,10 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     is_generation = _is_image_generation_request(raw_text)
     is_edit = _is_image_edit_request(raw_text)
     reply_image_file_id = _reply_image_target(msg)
+    if is_edit and not reply_image_file_id:
+        # Explicit /edit accepts a reply to ANY image in the chat, not just
+        # bot-sent ones — the command itself disambiguates intent.
+        reply_image_file_id = _message_image_target(getattr(msg, "reply_to_message", None))
     own_image_file_id = _message_image_target(msg)
 
     if not _is_private_super_admin(chat, msg.from_user.id if msg.from_user else None):
