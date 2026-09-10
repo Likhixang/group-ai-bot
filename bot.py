@@ -2610,10 +2610,26 @@ async def _expand_image_edit_prompt(prompt: str) -> str:
 
 async def _expand_prompt_with_luna(prompt: str, system: str, log_tag: str) -> str:
     try:
+        # Give luna real-world context: search the prompt topic so expanded
+        # prompts reference actual appearances/scenarios instead of guesses.
+        search_context = ""
+        try:
+            results = await _web_search(prompt, max_results=3)
+            if results:
+                lines = ["参考资料（来自网络搜索，仅用于把握真实细节，不要照抄、不要输出 URL）："]
+                for i, item in enumerate(results, start=1):
+                    snippet = (item.get("snippet") or "").strip()
+                    if snippet:
+                        lines.append(f"{i}. {item.get('title', '').strip()}: {snippet}")
+                search_context = "\n".join(lines)
+        except Exception as search_exc:
+            logger.warning("%s web search failed (ignored): %s", log_tag, search_exc)
+
+        user_content = prompt if not search_context else f"{prompt}\n\n{search_context}"
         expanded = await _ask_ai_once(
             [
                 {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": user_content},
             ],
             LUNA_MODEL,
             temperature=0.7,
