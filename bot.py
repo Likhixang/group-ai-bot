@@ -137,6 +137,7 @@ EMOJI_RE = re.compile(
 AI_STREAM_TIMEOUT_RETRIES = 2
 IMAGE_GEN_TIMEOUT = 300
 IMAGE_GEN_RETRIES = 1
+IMAGE_GEN_RETRY_DELAY = 3
 
 # --- AVScan 图片检索 ---
 # AVScan 当前没有公开 API key / 文档；前端使用同源 POST /search 上传 `file`。
@@ -2604,9 +2605,16 @@ async def _generate_image(prompt: str) -> bytes:
                     raise RuntimeError(f"Image HTTP {resp.status_code}: {resp.text[:500]}")
                 return _extract_image_bytes(resp.json())
         except Exception as e:
-            if _is_timeout_error(e) and attempt < IMAGE_GEN_RETRIES:
-                last_exc = e
-                logger.warning("image gen timeout attempt %s/%s, retrying", attempt + 1, IMAGE_GEN_RETRIES)
+            last_exc = e
+            if attempt < IMAGE_GEN_RETRIES:
+                logger.warning(
+                    "image gen attempt %s/%s failed (%s), retrying in %ss...",
+                    attempt + 1,
+                    IMAGE_GEN_RETRIES + 1,
+                    e,
+                    IMAGE_GEN_RETRY_DELAY * (attempt + 1),
+                )
+                await asyncio.sleep(IMAGE_GEN_RETRY_DELAY * (attempt + 1))
                 continue
             raise
 
@@ -2643,9 +2651,16 @@ async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
                     raise RuntimeError(f"Image edit HTTP {resp.status_code}: {resp.text[:500]}")
                 return _extract_image_bytes(resp.json())
         except Exception as e:
-            if _is_timeout_error(e) and attempt < IMAGE_GEN_RETRIES:
-                last_exc = e
-                logger.warning("image edit timeout attempt %s/%s, retrying", attempt + 1, IMAGE_GEN_RETRIES)
+            last_exc = e
+            if attempt < IMAGE_GEN_RETRIES:
+                logger.warning(
+                    "image edit attempt %s/%s failed (%s), retrying in %ss...",
+                    attempt + 1,
+                    IMAGE_GEN_RETRIES + 1,
+                    e,
+                    IMAGE_GEN_RETRY_DELAY * (attempt + 1),
+                )
+                await asyncio.sleep(IMAGE_GEN_RETRY_DELAY * (attempt + 1))
                 continue
             raise
 
