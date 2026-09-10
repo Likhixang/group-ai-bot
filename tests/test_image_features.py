@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import importlib
 import os
 import sys
@@ -244,7 +245,7 @@ def test_av_cover_command_sends_jacket_and_schedules_cleanup(monkeypatch):
     async def fake_download_r18dev(cover_url):
         raise AssertionError("fourhoi success must not fall back to r18dev")
 
-    async def fake_reply_photo(*, photo, caption, parse_mode):
+    async def fake_reply_photo(*, photo, caption, parse_mode, **kwargs):
         assert photo.name == "cover.jpg"
         assert photo.read() == b"jpeg-bytes"
         assert "&lt;unsafe &amp; title&gt;" in caption or "Fourhoi" in caption
@@ -301,7 +302,7 @@ def test_av_cover_command_falls_back_to_r18dev_when_fourhoi_misses(monkeypatch):
         assert cover_url.endswith("demopl.jpg")
         return b"jpeg-bytes"
 
-    async def fake_reply_photo(*, photo, caption, parse_mode):
+    async def fake_reply_photo(*, photo, caption, parse_mode, **kwargs):
         assert photo.name == "cover.jpg"
         assert photo.read() == b"jpeg-bytes"
         assert "R18.dev" in caption
@@ -386,3 +387,136 @@ def test_plain_av_image_caption_stays_on_avscan_path(monkeypatch):
     assert calls["upload"] == [b"upload"]
     assert calls["edits"] == [("result", {"parse_mode": bot.ParseMode.HTML, "disable_web_page_preview": True})]
     assert calls["cleanup"] == [(-100123, [100, 100, 101])]
+
+
+def test_parse_bing_image_candidates_prefers_originals_and_dedupes():
+    html = (
+        '<a m="{&quot;murl&quot;:&quot;https://cdn.example.com/a.jpg&quot;,&quot;turl&quot;:&quot;https://t1.example.com/a.jpg&quot;}"></a>'
+        '<a m="{&quot;murl&quot;:&quot;https://cdn.example.com/a.jpg&quot;}"></a>'
+        '<a m="{&quot;murl&quot;:&quot;https://img.example.com/b.jpg?a=1&amp;b=2&quot;}"></a>'
+        '<a m="{&quot;murl&quot;:&quot;ftp://bad.example/c.jpg&quot;}"></a>'
+        '<a m="{&quot;turl&quot;:&quot;https://cdn.example.com/a.jpg&quot;}"></a>'
+        '<a m="{&quot;turl&quot;:&quot;https://t2.example.com/x.jpg&quot;}"></a>'
+    )
+    assert bot._parse_bing_image_candidates(html) == [
+        "https://cdn.example.com/a.jpg",
+        "https://img.example.com/b.jpg?a=1&b=2",
+        "https://t1.example.com/a.jpg",
+        "https://t2.example.com/x.jpg",
+    ]
+    assert bot._parse_bing_image_candidates("") == []
+    assert bot._parse_bing_image_candidates(None) == []
+
+
+def test_find_reference_image_skips_failed_candidates(monkeypatch):
+    async def fake_search(query):
+        assert query == "柴犬"
+        return [
+            "https://bad.example/1.png",
+            "https://ok.example/2.jpg",
+            "https://never.example/3.jpg",
+        ]
+
+    calls = []
+
+    async def fake_download(url):
+        calls.append(url)
+        if "ok" not in url:
+            raise RuntimeError("HTTP 403")
+        return b"jpeg-bytes"
+
+    monkeypatch.setattr(bot, "_search_reference_images", fake_search)
+    monkeypatch.setattr(bot, "_download_reference_image", fake_download)
+
+    assert asyncio.run(bot._find_reference_image("柴犬")) == b"jpeg-bytes"
+    assert calls == ["https://bad.example/1.png", "https://ok.example/2.jpg"]
+
+
+def test_find_reference_image_falls_back_when_search_or_downloads_fail(monkeypatch):
+    async def failing_search(query):
+        raise RuntimeError("HTTP 500")
+
+    monkeypatch.setattr(bot, "_search_reference_images", failing_search)
+    assert asyncio.run(bot._find_reference_image("x")) is None
+
+    async def empty_search(query):
+        return []
+
+    monkeypatch.setattr(bot, "_search_reference_images", empty_search)
+    assert asyncio.run(bot._find_reference_image("x")) is None
+
+    async def some_search(query):
+        return ["https://bad.example/1.png"]
+
+    async def failing_download(url):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(bot, "_search_reference_images", some_search)
+    monkeypatch.setattr(bot, "_download_reference_image", failing_download)
+    assert asyncio.run(bot._find_reference_image("x")) is None
+
+
+def test_reference_generation_and_edit_use_shared_edits_pipeline(monkeypatch):
+    captured = []
+
+    async def fake_post(prompt, image_bytes, *, model, log_tag):
+        captured.append((prompt, image_bytes, model, log_tag))
+        return b"final-image"
+
+    monkeypatch.setattr(bot, "_post_image_edits", fake_post)
+
+    assert asyncio.run(bot._generate_image_with_reference("画一只猫", b"ref")) == b"final-image"
+    assert captured[-1] == (
+        bot.IMAGE_REFERENCE_GUIDE + "画一只猫",
+        b"ref",
+        bot.IMAGE_MODEL,
+        "image reference",
+    )
+
+    assert asyncio.run(bot._edit_image("改成夜景", b"src")) == b"final-image"
+    assert captured[-1] == (
+        bot.IMAGE_EDIT_GUIDE + "改成夜景",
+        b"src",
+        bot.IMAGE_EDIT_MODEL,
+        "image edit",
+    )
+
+
+def test_post_image_edits_builds_multipart_request(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"b64_json": base64.b64encode(b"png-bytes").decode()}]}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, headers=None, files=None, data=None):
+            captured.update(url=url, headers=headers, files=files, data=data)
+            return FakeResponse()
+
+    monkeypatch.setattr(bot, "httpx", SimpleNamespace(AsyncClient=FakeClient))
+    monkeypatch.setattr(bot, "AI_BASE_URL", "https://api.example/v1")
+
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"payload"
+    out = asyncio.run(bot._post_image_edits("hello", png_bytes, model="m1", log_tag="tag"))
+    assert out == b"png-bytes"
+    assert captured["url"] == "https://api.example/v1/images/edits"
+    assert captured["data"] == {"model": "m1", "prompt": "hello", "response_format": "b64_json"}
+    name, blob, mime = captured["files"]["image"]
+    assert name == "input.png" and blob == png_bytes and mime == "image/png"
+
+    jpg_bytes = b"\xff\xd8\xff\xe0" + b"payload"
+    asyncio.run(bot._post_image_edits("hi", jpg_bytes, model="m2", log_tag="tag"))
+    assert captured["files"]["image"][0] == "input.jpg"
+    assert captured["files"]["image"][2] == "image/jpeg"

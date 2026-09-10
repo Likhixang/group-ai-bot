@@ -2699,7 +2699,12 @@ IMAGE_EDIT_GUIDE = (
 )
 
 
-async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
+async def _post_image_edits(prompt: str, image_bytes: bytes, *, model: str, log_tag: str) -> bytes:
+    """POST /images/edits（multipart 上传图片）。
+
+    「改图」和「带参考图生成」共用这条请求路径：上游把图片放进消息上下文，
+    与提示词一起交给 image-2。失败按 IMAGE_GEN_RETRIES 重试，最终失败向上抛。
+    """
     base = AI_BASE_URL.rstrip("/")
     headers = {"Authorization": f"Bearer {AI_API_KEY}"}
     if len(image_bytes) > 4 * 1024 * 1024:
@@ -2708,8 +2713,8 @@ async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
     ext = "png" if mime == "image/png" else "jpg"
     files = {"image": (f"input.{ext}", image_bytes, mime)}
     data = {
-        "model": IMAGE_EDIT_MODEL,
-        "prompt": IMAGE_EDIT_GUIDE + (prompt or ""),
+        "model": model,
+        "prompt": prompt,
         "response_format": "b64_json",
     }
     last_exc = None
@@ -2718,13 +2723,14 @@ async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
             async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
                 resp = await client.post(f"{base}/images/edits", headers=headers, files=files, data=data)
                 if resp.status_code >= 400:
-                    raise RuntimeError(f"Image edit HTTP {resp.status_code}: {resp.text[:500]}")
+                    raise RuntimeError(f"{log_tag} HTTP {resp.status_code}: {resp.text[:500]}")
                 return _extract_image_bytes(resp.json())
         except Exception as e:
             last_exc = e
             if attempt < IMAGE_GEN_RETRIES:
                 logger.warning(
-                    "image edit attempt %s/%s failed (%s), retrying in %ss...",
+                    "%s attempt %s/%s failed (%s), retrying in %ss...",
+                    log_tag,
                     attempt + 1,
                     IMAGE_GEN_RETRIES + 1,
                     e,
@@ -2733,6 +2739,129 @@ async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
                 await asyncio.sleep(IMAGE_GEN_RETRY_DELAY * (attempt + 1))
                 continue
             raise
+
+
+async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
+    """按用户要求改图：保持原图构图/主体，只改动要求的部分。"""
+    return await _post_image_edits(
+        IMAGE_EDIT_GUIDE + (prompt or ""),
+        image_bytes,
+        model=IMAGE_EDIT_MODEL,
+        log_tag="image edit",
+    )
+
+
+# --- 参考图：画图前搜一张视觉参考，与提示词一起交给 image-2 ---
+
+# Bing 图片搜索无需 API key。注意：必须先访问一次主站拿到 session cookie，
+# 否则同一查询会返回与关键词无关的结果页（机房 IP 实测）。
+BING_IMAGES_URL = "https://www.bing.com/images/search"
+BING_IMAGE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+REFERENCE_IMAGE_MAX_BYTES = 12 * 1024 * 1024
+REFERENCE_IMAGE_MAX_ATTEMPTS = 8
+
+# 结果页里每个 tile 的 m 属性是 HTML 转义过的 JSON：murl = 原图，turl = 缩略图。
+_BING_MURL_RE = re.compile(r"murl&quot;:&quot;(.+?)&quot;")
+_BING_TURL_RE = re.compile(r"turl&quot;:&quot;(.+?)&quot;")
+
+
+def _parse_bing_image_candidates(html_text: str) -> list[str]:
+    """解析 Bing 图片结果页：原图（murl）优先，缩略图（turl）兜底，去重保序。"""
+
+    def collect(pattern, limit: int) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for raw in pattern.findall(html_text or ""):
+            url = unescape(raw).strip()
+            if url.lower().startswith(("http://", "https://")) and url not in seen:
+                seen.add(url)
+                urls.append(url)
+            if len(urls) >= limit:
+                break
+        return urls
+
+    murls = collect(_BING_MURL_RE, 5)
+    seen_murls = set(murls)
+    turls = [url for url in collect(_BING_TURL_RE, 8) if url not in seen_murls][:3]
+    return murls + turls
+
+
+async def _search_reference_images(query: str) -> list[str]:
+    """Bing 图片搜索，返回候选参考图 URL 列表；失败抛异常（由调用方兜底）。"""
+    headers = {
+        "User-Agent": BING_IMAGE_USER_AGENT,
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        # 先访问主站拿 session cookie；缺少时 Bing 返回无关结果。
+        await client.get("https://www.bing.com/", headers=headers)
+        resp = await client.get(
+            BING_IMAGES_URL,
+            params={"q": query, "first": "1", "count": "20", "adlt": "moderate", "form": "HDRSC2"},
+            headers={**headers, "Referer": "https://www.bing.com/"},
+        )
+        resp.raise_for_status()
+    return _parse_bing_image_candidates(resp.text)
+
+
+async def _download_reference_image(url: str) -> bytes:
+    """下载一张参考图，压到 ≤1024px 的 JPEG；任何一步失败抛异常（换下一张）。"""
+    headers = {"User-Agent": BING_IMAGE_USER_AGENT, "Referer": "https://www.bing.com/"}
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        async with client.stream("GET", url, headers=headers) as resp:
+            if resp.status_code >= 400:
+                raise RuntimeError(f"reference image HTTP {resp.status_code}")
+            content_type = (resp.headers.get("content-type") or "").lower()
+            if content_type and not (
+                content_type.startswith("image/") or content_type == "application/octet-stream"
+            ):
+                raise RuntimeError(f"reference image is not an image: {content_type[:60]}")
+            body = await _read_limited_http_body(resp, REFERENCE_IMAGE_MAX_BYTES)
+    # 复用 AVScan 的预处理：分辨率/体积校验 + 缩到 1024px + 输出 JPEG。
+    return _prepare_avscan_image(body)
+
+
+async def _find_reference_image(query: str) -> Optional[bytes]:
+    """画图前找一张参考图；搜索或下载失败都静默返回 None（调用方回退纯文本）。"""
+    try:
+        candidates = await _search_reference_images(query)
+    except Exception as exc:
+        logger.warning("reference image search failed (ignored): %s", exc)
+        return None
+    if not candidates:
+        logger.info("reference image search: no results for %r", query[:80])
+        return None
+    for url in candidates[:REFERENCE_IMAGE_MAX_ATTEMPTS]:
+        try:
+            image_bytes = await _download_reference_image(url)
+        except Exception as exc:
+            logger.info("reference image candidate skipped (%s): %s", exc, url[:120])
+            continue
+        logger.info("reference image picked (%s bytes): %s", len(image_bytes), url[:120])
+        return image_bytes
+    return None
+
+
+# 参考图生成引导语：与“改图”相反 —— 参考图只提供主体外观，画面按提示词重新创作。
+IMAGE_REFERENCE_GUIDE = (
+    "请以用户提供的参考图为视觉参考，生成一张全新的图片："
+    "参考图中主体（人物、物体、产品、场景等）的外形、颜色和风格要尽量一致，"
+    "但画面构图、场景与视角按下面的要求重新创作，不要直接复刻参考图。\n"
+    "画面要求："
+)
+
+
+async def _generate_image_with_reference(prompt: str, reference_bytes: bytes) -> bytes:
+    """带参考图的文生图：参考图与提示词一起交给 image-2（复用 /images/edits）。"""
+    return await _post_image_edits(
+        IMAGE_REFERENCE_GUIDE + (prompt or ""),
+        reference_bytes,
+        model=IMAGE_MODEL,
+        log_tag="image reference",
+    )
 
 
 def _split_video_prefix(raw_text: str) -> Optional[str]:
@@ -4399,8 +4528,20 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             image_bytes = await _edit_image(final_prompt, source_bytes)
             model_name = IMAGE_EDIT_MODEL
         else:
-            final_prompt = await _expand_image_prompt(image_prompt)
-            image_bytes = await _generate_image(final_prompt)
+            # 提示词扩写与参考图并行准备；参考图缺失时回退纯文本生成。
+            final_prompt, reference_bytes = await asyncio.gather(
+                _expand_image_prompt(image_prompt),
+                _find_reference_image(image_prompt),
+            )
+            if reference_bytes:
+                logger.info(
+                    "image_reference_used: prompt=%r bytes=%s",
+                    image_prompt[:100],
+                    len(reference_bytes),
+                )
+                image_bytes = await _generate_image_with_reference(final_prompt, reference_bytes)
+            else:
+                image_bytes = await _generate_image(final_prompt)
             model_name = IMAGE_MODEL
         caption = (
             f"<blockquote>模型: {escape(model_name)}</blockquote>\n"
