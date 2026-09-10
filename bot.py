@@ -2574,6 +2574,37 @@ async def _ask_ai_once(messages, model_name: str, temperature: float = 0.2) -> s
     return str(content)
 
 
+IMAGE_PROMPT_EXPAND_SYSTEM = (
+    "你是文生图提示词工程师。把用户的一句画图需求扩写成一段详尽的英文提示词："
+    "明确画面主体、场景、构图、风格、光线、色调和画面中需要出现的文字内容（文字必须用引号显式标出原文）"
+    "需要中文文字时原样保留中文。只输出扩写后的提示词本身，不要任何解释、前缀或引号包裹。"
+)
+
+
+async def _expand_image_prompt(prompt: str) -> str:
+    """用 gpt-5.6-luna 把用户的简短画图需求扩写成详细提示词。
+
+    失败时静默回退原始 prompt，不阻塞画图。
+    """
+    try:
+        expanded = await _ask_ai_once(
+            [
+                {"role": "system", "content": IMAGE_PROMPT_EXPAND_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            LUNA_MODEL,
+            temperature=0.7,
+        )
+        expanded = (expanded or "").strip()
+        if not expanded:
+            return prompt
+        logger.info("image prompt expanded: %s chars -> %s chars", len(prompt), len(expanded))
+        return expanded[:2000]
+    except Exception as exc:
+        logger.warning("image prompt expansion failed, using raw prompt: %s", exc)
+        return prompt
+
+
 def _extract_image_bytes(data: dict) -> bytes:
     items = data.get("data") or []
     if not items:
@@ -4312,11 +4343,20 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             source_bytes = await _download_telegram_file(context, edit_file_id)
             image_bytes = await _edit_image(image_prompt, source_bytes)
             model_name = IMAGE_EDIT_MODEL
+            final_prompt = image_prompt
         else:
-            image_bytes = await _generate_image(image_prompt)
+            final_prompt = await _expand_image_prompt(image_prompt)
+            image_bytes = await _generate_image(final_prompt)
             model_name = IMAGE_MODEL
-        caption = f"模型: {model_name}\n提示词: {prompt[:850]}"
-        await msg.reply_photo(photo=_photo_file(image_bytes), caption=caption)
+        caption = (
+            f"<blockquote>模型: {escape(model_name)}</blockquote>\n"
+            f"<blockquote>提示词: {escape(final_prompt[:850])}</blockquote>"
+        )
+        await msg.reply_photo(
+            photo=_photo_file(image_bytes),
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
         try:
             await context.bot.delete_message(chat_id=status.chat_id, message_id=status.message_id)
         except Exception:
