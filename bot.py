@@ -2580,16 +2580,39 @@ IMAGE_PROMPT_EXPAND_SYSTEM = (
     "需要中文文字时原样保留中文。只输出扩写后的提示词本身，不要任何解释、前缀或引号包裹。"
 )
 
+IMAGE_EDIT_PROMPT_EXPAND_SYSTEM = (
+    "你是图像编辑指令工程师。用户会给出对一张已有图片的修改要求。"
+    "把这句要求扩写成一段清晰详尽的编辑指令：明确要改动的区域或对象、改动后的具体样子"
+    "（颜色、物体、文字等，文字必须用引号显式标出原文，中文原样保留），"
+    "并强调图中未提及的部分保持原样。只输出扩写后的指令本身，不要任何解释、前缀或引号包裹。"
+)
+
 
 async def _expand_image_prompt(prompt: str) -> str:
     """用 gpt-5.6-luna 把用户的简短画图需求扩写成详细提示词。
 
     失败时静默回退原始 prompt，不阻塞画图。
     """
+    return await _expand_prompt_with_luna(
+        prompt, IMAGE_PROMPT_EXPAND_SYSTEM, "image prompt expanded"
+    )
+
+
+async def _expand_image_edit_prompt(prompt: str) -> str:
+    """用 gpt-5.6-luna 把用户的简短改图要求扩写成详细编辑指令。
+
+    失败时静默回退原始 prompt，不阻塞改图。
+    """
+    return await _expand_prompt_with_luna(
+        prompt, IMAGE_EDIT_PROMPT_EXPAND_SYSTEM, "image edit prompt expanded"
+    )
+
+
+async def _expand_prompt_with_luna(prompt: str, system: str, log_tag: str) -> str:
     try:
         expanded = await _ask_ai_once(
             [
-                {"role": "system", "content": IMAGE_PROMPT_EXPAND_SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
             LUNA_MODEL,
@@ -2598,10 +2621,10 @@ async def _expand_image_prompt(prompt: str) -> str:
         expanded = (expanded or "").strip()
         if not expanded:
             return prompt
-        logger.info("image prompt expanded: %s chars -> %s chars", len(prompt), len(expanded))
+        logger.info("%s: %s chars -> %s chars", log_tag, len(prompt), len(expanded))
         return expanded[:2000]
     except Exception as exc:
-        logger.warning("image prompt expansion failed, using raw prompt: %s", exc)
+        logger.warning("%s failed, using raw prompt: %s", log_tag, exc)
         return prompt
 
 
@@ -4341,9 +4364,9 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         if edit_file_id:
             source_bytes = await _download_telegram_file(context, edit_file_id)
-            image_bytes = await _edit_image(image_prompt, source_bytes)
+            final_prompt = await _expand_image_edit_prompt(image_prompt)
+            image_bytes = await _edit_image(final_prompt, source_bytes)
             model_name = IMAGE_EDIT_MODEL
-            final_prompt = image_prompt
         else:
             final_prompt = await _expand_image_prompt(image_prompt)
             image_bytes = await _generate_image(final_prompt)
