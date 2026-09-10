@@ -2611,9 +2611,8 @@ async def _generate_image(prompt: str) -> bytes:
             raise
 
 
-# 图生图编辑引导语：AxonHub 走 /images/generations + image 字段（图生图重画），
-# 不是标准 /images/edits 编辑。在提示词前加强调引导，尽量让模型保留原图
-# 构图/主体/背景，只改用户要求的部分。
+# 图像编辑引导语：标准 OpenAI /images/edits 接口，multipart/form-data 上传原图。
+# 配合提示词强调保留原图构图与主体，只按用户要求做局部改动。
 IMAGE_EDIT_GUIDE = (
     "请基于用户提供的原图进行编辑修改，"
     "严格保持原图的构图、主体、人物、背景和整体风格不变，"
@@ -2628,19 +2627,18 @@ async def _edit_image(prompt: str, image_bytes: bytes) -> bytes:
     if len(image_bytes) > 4 * 1024 * 1024:
         image_bytes = _prepare_avscan_image(image_bytes)
     mime = "image/png" if image_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
-    img_b64 = "data:" + mime + ";base64," + base64.b64encode(image_bytes).decode()
-    payload = {
+    ext = "png" if mime == "image/png" else "jpg"
+    files = {"image": (f"input.{ext}", image_bytes, mime)}
+    data = {
         "model": IMAGE_EDIT_MODEL,
         "prompt": IMAGE_EDIT_GUIDE + (prompt or ""),
-        "image": img_b64,
-        "n": 1,
-        "size": "1024x1024",
+        "response_format": "b64_json",
     }
     last_exc = None
     for attempt in range(IMAGE_GEN_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
-                resp = await client.post(f"{base}/images/generations", headers=headers, json=payload)
+                resp = await client.post(f"{base}/images/edits", headers=headers, files=files, data=data)
                 if resp.status_code >= 400:
                     raise RuntimeError(f"Image edit HTTP {resp.status_code}: {resp.text[:500]}")
                 return _extract_image_bytes(resp.json())
