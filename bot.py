@@ -179,6 +179,21 @@ R18DEV_USER_AGENT = (
     "group-ai-bot/1.0 "
     "(single cover lookup; https://github.com/Likhixang/group-ai-bot)"
 )
+# 演员名 → 热门番号查询：javdb 搜索 + r18.dev 名字桥接 + javdatabase 收藏排序。
+# javdatabase.com 的 idol 页支持 `?_sort_=most_favorited`（收藏数倒序=最热门），
+# 匿名可访问且无 CF 防护；javdb 只用来把中文/日文名转成英文名（r18.dev 无名字搜索）。
+JAVDB_SEARCH_URL = "https://javdb.com/search?q={query}&f=actor"
+JAVDB_TIMEOUT = max(5, int(os.getenv("JAVDB_TIMEOUT", "25")))
+JAVDB_MAX_HTML_BYTES = 2 * 1024 * 1024
+JAVDB_USER_AGENT = FOURHOI_USER_AGENT
+JAVDATABASE_SEARCH_URL = "https://www.javdatabase.com/?s={query}&post_type=idols"
+JAVDATABASE_ACTOR_URL = "https://www.javdatabase.com/idols/{slug}/?_sort_=most_favorited"
+JAVDATABASE_TIMEOUT = max(5, int(os.getenv("JAVDATABASE_TIMEOUT", "30")))
+JAVDATABASE_MAX_HTML_BYTES = 6 * 1024 * 1024
+JAVDATABASE_USER_AGENT = FOURHOI_USER_AGENT
+# /av 演员名：先用 javdb actor 页前 N 部番号经 r18.dev 统计出英文名，再查 javdatabase。
+AV_ACTOR_ROMJI_SAMPLE = 20
+AV_ACTOR_TOP_LIMIT = max(1, min(10, int(os.getenv("AV_ACTOR_TOP_LIMIT", "10"))))
 
 # --- 视频生成 (agnes-video-v2.0 异步任务 API) ---
 # 注意：创建任务可走 AxonHub，但取结果必须直连上游 —— AxonHub 会剥掉响应里的
@@ -3103,6 +3118,14 @@ class R18DevRateLimitedError(R18DevError):
     """R18.dev temporarily refused the lookup due to rate limiting."""
 
 
+class ActorSearchError(RuntimeError):
+    """A safe, user-facing failure from the actress → top-videos lookup."""
+
+
+class ActorNotFoundError(ActorSearchError):
+    """No actress page matched the requested name on any upstream source."""
+
+
 def _normalize_av_cover_code(raw_code: str) -> Optional[str]:
     """Return a safe R18.dev DVD ID, or None when `/av` has no valid code."""
     code = (raw_code or "").strip().upper()
@@ -3154,8 +3177,12 @@ def _validate_r18dev_cover_url(cover_url: str) -> str:
     return cover_url
 
 
-def _r18dev_cover_from_payload(payload: dict) -> tuple[str, str]:
-    """Extract a strictly allow-listed DMM jacket URL from R18.dev JSON."""
+def _r18dev_cover_from_payload(payload: dict) -> tuple[str, str, list[str]]:
+    """Extract a strictly allow-listed DMM jacket URL from R18.dev JSON.
+
+    Returns ``(title, cover_url, actresses)``; actresses are the cleaned
+    display names from the payload (untrusted text, bounded to 10 entries).
+    """
     images = payload.get("images") if isinstance(payload, dict) else None
     jacket = images.get("jacket_image") if isinstance(images, dict) else None
     cover_url = jacket.get("large2") if isinstance(jacket, dict) else None
@@ -3164,11 +3191,25 @@ def _r18dev_cover_from_payload(payload: dict) -> tuple[str, str]:
     cover_url = _validate_r18dev_cover_url(cover_url)
 
     title = payload.get("title")
-    return ((title.strip()[:800] if isinstance(title, str) else ""), cover_url)
+    actresses = []
+    raw_actresses = payload.get("actresses") if isinstance(payload, dict) else None
+    if isinstance(raw_actresses, list):
+        for actress in raw_actresses:
+            if not isinstance(actress, dict):
+                continue
+            name = actress.get("name")
+            if isinstance(name, str):
+                cleaned = name.strip()[:200]
+                if cleaned and cleaned not in actresses:
+                    actresses.append(cleaned)
+            if len(actresses) >= 10:
+                break
+    return ((title.strip()[:800] if isinstance(title, str) else ""), cover_url, actresses)
 
 
-async def _lookup_r18dev_cover(dvd_id: str) -> tuple[str, str]:
-    """Look up one DVD ID and return its title plus trusted DMM cover URL."""
+async def _lookup_r18dev_cover(dvd_id: str) -> tuple[str, str, list[str]]:
+    """Look up one DVD ID and return its title, trusted DMM cover URL, and
+    the actress display names from the same JSON payload."""
     lookup_url = R18DEV_LOOKUP_URL.format(
         dvd_id=urllib.parse.quote(dvd_id, safe="")
     )
@@ -3359,6 +3400,266 @@ async def _download_fourhoi_cover(cover_url: str) -> bytes:
     except (OSError, Image.DecompressionBombError) as exc:
         raise FourhoiError("Fourhoi returned an invalid cover image") from exc
     return body
+
+
+def _parse_javdb_actor_search(html: str, query: str) -> Optional[tuple[str, str]]:
+    """Return ``(actor_path, display_name)`` from a JavDB `/search?f=actor` page.
+
+    Prefers an exact (whitespace-insensitive) name match over a censored
+    (有碼) actor; falls back to the first boxed result that mentions the
+    query. Returns None when nothing usable is found.
+    """
+    if not html:
+        return None
+    query_norm = re.sub(r"\s+", "", (query or "")).lower()
+    boxes = re.findall(
+        r'<div class="box actor-box">\s*'
+        r'<a href="(?P<href>/actors/[A-Za-z0-9]+)"[^>]*>(?P<body>.*?)</a>\s*</div>',
+        html,
+        flags=re.S | re.I,
+    )
+    candidates = []
+    for href, body in boxes:
+        strong = re.search(r"<strong[^>]*>(.*?)</strong>", body, flags=re.S)
+        if not strong:
+            continue
+        name = re.sub(r"<[^>]+>", "", strong.group(1)).strip()
+        if not name:
+            continue
+        name_norm = re.sub(r"\s+", "", name).lower()
+        uncensored = "無碼" in body or "uncensored" in body.lower()
+        score = 0
+        if query_norm and query_norm in name_norm:
+            score = 2 if name_norm == query_norm else 1
+        candidates.append((score, uncensored, href, name))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    score, uncensored, href, name = candidates[0]
+    if score <= 0 and uncensored:
+        return None
+    return (href, name)
+
+
+def _parse_javdb_actor_codes(html: str, limit: int) -> list[str]:
+    """Extract DVD IDs from a JavDB actor page's video grid."""
+    if not html:
+        return []
+    codes = [
+        code.strip()
+        for code in re.findall(
+            r'<div class="video-title"><strong>([A-Z0-9-]+)</strong>', html
+        )
+        if code.strip()
+    ]
+    seen: list[str] = []
+    for code in codes:
+        if code not in seen:
+            seen.append(code)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+async def _lookup_javdb_actor(query: str) -> tuple[str, str]:
+    """Search JavDB for an actress; return ``(actor_path, display_name)``."""
+    headers = {
+        "User-Agent": JAVDB_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    }
+    url = JAVDB_SEARCH_URL.format(query=urllib.parse.quote(query, safe=""))
+    timeout = httpx.Timeout(JAVDB_TIMEOUT, connect=8.0)
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=False, trust_env=False
+        ) as client:
+            response = await client.get(url, headers=headers)
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise ActorSearchError("JavDB 暂时无法访问") from exc
+    if response.status_code == 429:
+        raise ActorSearchError("JavDB 请求过于频繁")
+    if response.status_code >= 400:
+        raise ActorSearchError(f"JavDB HTTP {response.status_code}")
+    if len(response.content) > JAVDB_MAX_HTML_BYTES:
+        raise ActorSearchError("JavDB 响应过大")
+    found = _parse_javdb_actor_search(response.text, query)
+    if found is None:
+        raise ActorNotFoundError(f"没有找到演员「{query}」")
+    return found
+
+
+async def _lookup_javdb_actor_codes(actor_path: str, limit: int) -> list[str]:
+    """Fetch a JavDB actor page and return its recent DVD IDs."""
+    headers = {
+        "User-Agent": JAVDB_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    }
+    url = "https://javdb.com" + actor_path
+    timeout = httpx.Timeout(JAVDB_TIMEOUT, connect=8.0)
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=False, trust_env=False
+        ) as client:
+            response = await client.get(url, headers=headers)
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise ActorSearchError("JavDB 暂时无法访问") from exc
+    if response.status_code >= 400:
+        raise ActorSearchError(f"JavDB HTTP {response.status_code}")
+    if len(response.content) > JAVDB_MAX_HTML_BYTES:
+        raise ActorSearchError("JavDB 响应过大")
+    codes = _parse_javdb_actor_codes(response.text, limit)
+    if not codes:
+        raise ActorNotFoundError("JavDB 演员页没有可用的作品")
+    return codes
+
+
+async def _resolve_actor_romaji(codes: list[str]) -> str:
+    """Map a set of DVD IDs to the most frequent English actress name via
+    R18.dev, which is the bridge into javdatabase.com's English slugs.
+    """
+    counts: dict[str, int] = {}
+    for code in codes[:AV_ACTOR_ROMJI_SAMPLE]:
+        try:
+            _title, _cover, actresses = await _lookup_r18dev_cover(code)
+        except (R18DevError, R18DevNotFoundError, R18DevRateLimitedError):
+            continue
+        for name in actresses:
+            counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        raise ActorSearchError("无法确认该演员的英文名")
+    # 取最高频;同频时取更长(更完整)的名字
+    best = max(counts, key=lambda name: (counts[name], len(name)))
+    return best
+
+
+def _parse_javdatabase_actor_slug(html: str, query: str) -> Optional[str]:
+    """Extract the first idol slug from a javdatabase.com search page."""
+    if not html:
+        return None
+    query_norm = re.sub(r"\s+", "", (query or "")).lower()
+    matches = re.findall(
+        r'href="https?://(?:www\.)?javdatabase\.com/idols/([a-z0-9-]+)/"',
+        html,
+        flags=re.I,
+    )
+    if not matches:
+        return None
+    # 优先完全匹配查询词的 slug(破折号-空格归一);否则取第一个
+    for slug in matches:
+        if slug.replace("-", "") == query_norm:
+            return slug
+    return matches[0]
+
+
+async def _lookup_javdatabase_actor_slug(romaji: str) -> str:
+    """Search javdatabase.com for an English actress name → idol slug."""
+    headers = {
+        "User-Agent": JAVDATABASE_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    url = JAVDATABASE_SEARCH_URL.format(query=urllib.parse.quote(romaji, safe=""))
+    timeout = httpx.Timeout(JAVDATABASE_TIMEOUT, connect=8.0)
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=False, trust_env=False
+        ) as client:
+            response = await client.get(url, headers=headers)
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise ActorSearchError("javdatabase 暂时无法访问") from exc
+    if response.status_code >= 400:
+        raise ActorSearchError(f"javdatabase HTTP {response.status_code}")
+    if len(response.content) > JAVDATABASE_MAX_HTML_BYTES:
+        raise ActorSearchError("javdatabase 响应过大")
+    slug = _parse_javdatabase_actor_slug(response.text, romaji)
+    if not slug:
+        raise ActorNotFoundError(f"javdatabase 没有演员「{romaji}」")
+    return slug
+
+
+def _parse_javdatabase_top_movies(html: str, limit: int) -> list[dict]:
+    """Parse the first N movie cards from a javdatabase idol page."""
+    if not html:
+        return []
+    start = html.find("facetwp-template")
+    if start < 0:
+        start = 0
+    segment = html[start:]
+    cards = re.split(r'<div class="col-md-3', segment)[1:]
+    movies: list[dict] = []
+    for card in cards[:limit]:
+        code_match = re.search(
+            r'class="display-6 pcard"[^>]*>\s*<a[^>]*>\s*([A-Z0-9-]+)', card
+        )
+        if not code_match:
+            continue
+        code = code_match.group(1).strip()
+        cover_match = re.search(r'<img src="([^"]+)"', card)
+        # 标题在 mt-auto 区块的 cut-text 里；pcard 里的第一个 cut-text 是番号本身。
+        meta_match = re.search(r'<div class="mt-auto">(.*?)</div>\s*</div>', card, flags=re.S)
+        title_match = (
+            re.search(r'class="cut-text">([^<]{1,300})</a>', meta_match.group(1), flags=re.S)
+            if meta_match
+            else None
+        )
+        date_match = re.search(r"(\d{4}-\d{2}-\d{2})", card)
+        title = ""
+        if title_match:
+            title = re.sub(r"\s+", " ", title_match.group(1)).strip()
+        movies.append(
+            {
+                "code": code,
+                "title": title,
+                "cover": cover_match.group(1) if cover_match else "",
+                "date": date_match.group(1) if date_match else "",
+            }
+        )
+    return movies
+
+
+async def _lookup_javdatabase_top_movies(slug: str, limit: int) -> list[dict]:
+    """Fetch an idol page sorted by most-favorited and parse top movies."""
+    headers = {
+        "User-Agent": JAVDATABASE_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    url = JAVDATABASE_ACTOR_URL.format(slug=urllib.parse.quote(slug, safe=""))
+    timeout = httpx.Timeout(JAVDATABASE_TIMEOUT, connect=8.0)
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=False, trust_env=False
+        ) as client:
+            response = await client.get(url, headers=headers)
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise ActorSearchError("javdatabase 暂时无法访问") from exc
+    if response.status_code >= 400:
+        raise ActorSearchError(f"javdatabase HTTP {response.status_code}")
+    if len(response.content) > JAVDATABASE_MAX_HTML_BYTES:
+        raise ActorSearchError("javdatabase 响应过大")
+    return _parse_javdatabase_top_movies(response.text, limit)
+
+
+async def _lookup_actor_top_videos(name: str) -> list[dict]:
+    """Full pipeline: actress name → top N movies sorted by favorites.
+
+    JavDB translates a CJK name to its canonical page; R18.dev turns sample
+    DVD IDs into the English romaji name; javdatabase.com then provides the
+    most-favorited ranking. The user-facing errors are already safe.
+    """
+    actor_path, display_name = await _lookup_javdb_actor(name)
+    codes = await _lookup_javdb_actor_codes(actor_path, AV_ACTOR_ROMJI_SAMPLE)
+    romaji = await _resolve_actor_romaji(codes)
+    slug = await _lookup_javdatabase_actor_slug(romaji)
+    movies = await _lookup_javdatabase_top_movies(slug, AV_ACTOR_TOP_LIMIT)
+    if not movies:
+        raise ActorSearchError("javdatabase 没有返回可用的作品")
+    for movie in movies:
+        movie["actor_display"] = display_name
+        movie["actor_romaji"] = romaji
+    return movies
 
 
 def _avscan_number(value) -> float:
@@ -4246,13 +4547,22 @@ async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await on_image_request(update, context)
 
 
-def _format_av_cover_caption(dvd_id: str, title: str, source_label: str = "Fourhoi") -> str:
+def _format_av_cover_caption(
+    dvd_id: str,
+    title: str,
+    source_label: str = "Fourhoi",
+    actresses: Optional[list[str]] = None,
+) -> str:
     """Render bounded, escaped cover metadata for Telegram HTML captions."""
     compact_title = " ".join((title or "").split())[:120]
     lines = [
         f"🖼 <b>{escape(source_label)} 封面</b>",
         f"番号：<code>{escape(dvd_id)}</code>",
     ]
+    if actresses:
+        names = [escape(name) for name in actresses if isinstance(name, str) and name.strip()][:10]
+        if names:
+            lines.append("主演：" + "、".join(names))
     if compact_title:
         lines.append(escape(compact_title))
     return "\n".join(lines)
@@ -4296,7 +4606,7 @@ async def _av_cover_cmd(
         except FourhoiError:
             # Fourhoi missed (404/rate-limited/unreachable) → R18.dev fallback.
             source_label = "R18.dev"
-            title, cover_url = await _lookup_r18dev_cover(dvd_id)
+            title, cover_url, actresses = await _lookup_r18dev_cover(dvd_id)
             image_bytes = await _download_r18dev_cover(cover_url)
             logger.info(
                 "r18dev_cover_fallback: chat=%s msg=%s cover_bytes=%s",
@@ -4304,9 +4614,24 @@ async def _av_cover_cmd(
                 msg.message_id,
                 len(image_bytes),
             )
+        else:
+            # Fourhoi serves covers only, no metadata. When it hits, enrich the
+            # caption with the R18.dev title/actresses when available; never
+            # fail the Fourhoi delivery just because R18.dev is unavailable.
+            actresses: list[str] = []
+            try:
+                title, _cover_url, actresses = await _lookup_r18dev_cover(dvd_id)
+            except R18DevError:
+                logger.info(
+                    "fourhoi cover enrichment skipped: chat=%s msg=%s",
+                    chat.id,
+                    msg.message_id,
+                )
         cover_message = await msg.reply_photo(
             photo=_r18dev_cover_file(image_bytes),
-            caption=_format_av_cover_caption(dvd_id, title, source_label),
+            caption=_format_av_cover_caption(
+                dvd_id, title, source_label, actresses
+            ),
             parse_mode=ParseMode.HTML,
             read_timeout=60,
             write_timeout=60,
@@ -4354,6 +4679,91 @@ async def _av_cover_cmd(
         _schedule_av_cleanup(context, chat.id, msg, status, cover_message)
 
 
+def _format_av_actor_top(movies: list[dict]) -> str:
+    """Render the top-N actress list as a compact HTML text message."""
+    if not movies:
+        return "🔎 没有找到该演员的作品。"
+    actor_display = movies[0].get("actor_display") or ""
+    actor_romaji = movies[0].get("actor_romaji") or ""
+    header = "🎬 " + escape(actor_display or actor_romaji or "演员") + " 最热门作品"
+    lines = [header]
+    for index, movie in enumerate(movies[:AV_ACTOR_TOP_LIMIT], start=1):
+        code = escape(str(movie.get("code", "")))
+        date = escape(str(movie.get("date", "")))
+        title = escape(" ".join(str(movie.get("title", "")).split())[:60])
+        line = f"{index}. <code>{code}</code>"
+        if date:
+            line += f"（{date}）"
+        if title and title != code:
+            line += f" {title}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def _av_actor_cmd(
+    msg, chat, context: ContextTypes.DEFAULT_TYPE, raw_actor_name: str
+) -> None:
+    """Show an actress's most-favorited top videos for `/av <演员名>`."""
+    actor_name = " ".join((raw_actor_name or "").split())
+    if not actor_name or len(actor_name) > 80:
+        await _reply_and_cleanup(
+            msg,
+            context,
+            "❌ 演员名无效。用法：<code>/av 演员名</code>。",
+            NOTICE_DELETE_TTL,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        status = await _reply_text_and_track(msg, "🎬 正在查询演员作品...")
+    except Exception:
+        logger.exception("actor status reply failed: chat=%s msg=%s", chat.id, msg.message_id)
+        _schedule_av_cleanup(context, chat.id, msg)
+        return
+
+    try:
+        movies = await _lookup_actor_top_videos(actor_name)
+        result_text = _format_av_actor_top(movies)
+        await status.edit_text(
+            result_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        logger.info(
+            "av_actor_complete: chat=%s msg=%s actor=%s movies=%s",
+            chat.id,
+            msg.message_id,
+            actor_name,
+            len(movies),
+        )
+    except ActorNotFoundError:
+        logger.info("actor not found: chat=%s msg=%s actor=%s", chat.id, msg.message_id, actor_name)
+        await status.edit_text(
+            f"🔎 没有找到演员「{escape(actor_name)}」，试试英文名。",
+            parse_mode=ParseMode.HTML,
+        )
+    except ActorSearchError as exc:
+        logger.info(
+            "actor lookup failed: chat=%s msg=%s actor=%s error=%s",
+            chat.id,
+            msg.message_id,
+            actor_name,
+            exc,
+        )
+        await status.edit_text(
+            f"❌ {escape(str(exc))}", parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        logger.exception("actor lookup error: chat=%s msg=%s actor=%s", chat.id, msg.message_id, actor_name)
+        try:
+            await status.edit_text("❌ 演员作品服务暂时不可用，请稍后再试。")
+        except Exception:
+            logger.exception("actor failure reply edit failed: chat=%s msg=%s", chat.id, msg.message_id)
+    finally:
+        _schedule_av_cleanup(context, chat.id, msg, status)
+
+
 async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Look up a DVD jacket by code, or search a replied/captioned image via AVScan."""
     msg = update.effective_message
@@ -4383,7 +4793,12 @@ async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     if has_cover_argument:
-        await _av_cover_cmd(msg, chat, context, raw_cover_code or "")
+        raw_argument = (raw_cover_code or "").strip()
+        # 番号：至少含字母+数字的 3-48 位代码；否则按演员名查最热门作品。
+        if _normalize_av_cover_code(raw_argument):
+            await _av_cover_cmd(msg, chat, context, raw_argument)
+        else:
+            await _av_actor_cmd(msg, chat, context, raw_argument)
         return
 
     if not file_id:
@@ -4391,7 +4806,8 @@ async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             msg,
             context,
             (
-                "用法：<code>/av 番号</code> 查询 R18.dev 封面；"
+                "用法：<code>/av 番号</code> 查询封面（如 <code>/av ABP-001</code>）；"
+                "<code>/av 演员名</code> 查看最热门作品（如 <code>/av 三上悠亜</code>）；"
                 "或<b>回复一张图片</b>后发送 <code>/av</code>，"
                 "或发送图片时在 caption 写 <code>/av</code>。"
             ),
