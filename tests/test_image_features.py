@@ -128,9 +128,10 @@ def test_av_cover_parsing_and_r18dev_dmm_allow_list(monkeypatch):
     for invalid in ("ABC", "abc 000", "abc-000;evil", "../ABC000"):
         assert bot._normalize_fourhoi_slug(invalid) is None
 
-    title, cover_url = bot._r18dev_cover_from_payload(
+    title, cover_url, actresses = bot._r18dev_cover_from_payload(
         {
             "title": "<unsafe & title>",
+            "actresses": [{"name": "Yui Hatano"}, {"name": "  "}, {"name": "Yui Hatano"}],
             "images": {
                 "jacket_image": {
                     "large2": "https://pics.dmm.co.jp/digital/video/demo/demopl.jpg"
@@ -140,11 +141,16 @@ def test_av_cover_parsing_and_r18dev_dmm_allow_list(monkeypatch):
     )
     assert title == "<unsafe & title>"
     assert cover_url.endswith("demopl.jpg")
+    assert actresses == ["Yui Hatano"]
     assert "&lt;unsafe &amp; title&gt;" in bot._format_av_cover_caption(
         "ABC000", title
     )
     assert "Fourhoi" in bot._format_av_cover_caption("ABC000", title)
     assert "R18.dev" in bot._format_av_cover_caption("ABC000", title, "R18.dev")
+    caption_with_actress = bot._format_av_cover_caption(
+        "ABC000", title, "R18.dev", ["Yui Hatano", "<evil>"]
+    )
+    assert "主演：Yui Hatano、&lt;evil&gt;" in caption_with_actress
 
     for unsafe_url in (
         "http://pics.dmm.co.jp/digital/video/demo/demopl.jpg",
@@ -240,15 +246,19 @@ def test_av_cover_command_sends_jacket_and_schedules_cleanup(monkeypatch):
         return b"jpeg-bytes"
 
     async def fake_lookup_r18dev(dvd_id):
-        raise AssertionError("fourhoi success must not fall back to r18dev")
+        # Fourhoi hit: R18.dev is probed only for caption enrichment, and it
+        # may fail without taking the delivery down.
+        assert dvd_id == "ABC000"
+        raise bot.R18DevNotFoundError("r18dev has no jacket for abc-000")
 
     async def fake_download_r18dev(cover_url):
-        raise AssertionError("fourhoi success must not fall back to r18dev")
+        raise AssertionError("fourhoi success must not download from r18dev")
 
     async def fake_reply_photo(*, photo, caption, parse_mode, **kwargs):
         assert photo.name == "cover.jpg"
         assert photo.read() == b"jpeg-bytes"
         assert "&lt;unsafe &amp; title&gt;" in caption or "Fourhoi" in caption
+        assert "主演：" not in caption  # enrichment failed → no actress row
         assert parse_mode == bot.ParseMode.HTML
         return SimpleNamespace(message_id=102)
 
@@ -296,7 +306,11 @@ def test_av_cover_command_falls_back_to_r18dev_when_fourhoi_misses(monkeypatch):
 
     async def fake_lookup_r18dev(dvd_id):
         assert dvd_id == "ABC000"
-        return "<unsafe & title>", "https://pics.dmm.co.jp/digital/video/demo/demopl.jpg"
+        return (
+            "<unsafe & title>",
+            "https://pics.dmm.co.jp/digital/video/demo/demopl.jpg",
+            ["Yui Hatano"],
+        )
 
     async def fake_download_r18dev(cover_url):
         assert cover_url.endswith("demopl.jpg")
@@ -520,3 +534,168 @@ def test_post_image_edits_builds_multipart_request(monkeypatch):
     asyncio.run(bot._post_image_edits("hi", jpg_bytes, model="m2", log_tag="tag"))
     assert captured["files"]["image"][0] == "input.jpg"
     assert captured["files"]["image"][2] == "image/jpeg"
+
+
+JAVDB_ACTOR_SEARCH_HTML = """
+<div class="box actor-box">
+  <a href="/actors/Av2e" title="三上悠亜, 三上悠亞, 鬼头桃菜">
+    <figure class="image"><img class="avatar" src="https://c0.jdbstatic.com/avatars/av2e.jpg" /></figure>
+    <strong>三上悠亜</strong>
+  </a>
+</div>
+<div class="box actor-box">
+  <a href="/actors/xxxx" title="三上悠亜(無碼)">
+    <figure class="image"><img class="avatar" src="https://c0.jdbstatic.com/avatars/xxxx.jpg" /></figure>
+    <strong>三上悠亜</strong>
+    <span class="badge">無碼</span>
+  </a>
+</div>
+"""
+
+JAVDB_ACTOR_PAGE_HTML = """
+<div class="video-title"><strong>OFJE-712</strong> some title</div>
+<div class="video-title"><strong>OFJE-659</strong> another</div>
+<div class="video-title"><strong>OFJE-712</strong> duplicate</div>
+"""
+
+JAVDATABASE_SEARCH_HTML = """
+<a class="nav-link" href="https://www.javdatabase.com/idols/yui-hatano/">Yui Hatano</a>
+<a href="https://www.javdatabase.com/idols/yoko-nagisano/">Yoko Nagisano</a>
+"""
+
+JAVDATABASE_IDOL_HTML = """
+<div class="facetwp-template">
+  <div class="col-md-3">
+    <div class="movie-cover-thumb"><a href="https://www.javdatabase.com/movies/mird-277/"><img src="https://www.javdatabase.com/covers/thumb/mi/mird00277ps.webp" /></a></div>
+    <p class="display-6 pcard"><a href="https://www.javdatabase.com/movies/mird-277/" class="cut-text">MIRD-277 </a></p>
+    <div class="mt-auto"><a href="https://www.javdatabase.com/movies/mird-277/" class="cut-text">MOODYZ Bus Tour Title Here</a><br/>2026-03-13</div>
+  </div>
+  <div class="col-md-3">
+    <div class="movie-cover-thumb"><a href="https://www.javdatabase.com/movies/pred-884/"><img src="https://www.javdatabase.com/covers/thumb/pr/pred00884ps.webp" /></a></div>
+    <p class="display-6 pcard"><a href="https://www.javdatabase.com/movies/pred-884/" class="cut-text">PRED-884 </a></p>
+    <div class="mt-auto"><a href="https://www.javdatabase.com/movies/pred-884/" class="cut-text">Graduation Title</a><br/>2026-08-14</div>
+  </div>
+</div>
+"""
+
+
+def test_parse_javdb_actor_search_prefers_exact_and_censored():
+    assert bot._parse_javdb_actor_search(JAVDB_ACTOR_SEARCH_HTML, "三上悠亜") == (
+        "/actors/Av2e",
+        "三上悠亜",
+    )
+    # 无码 box 有 badge，但匹配完全时仍应选中前者（censored 优先）
+    assert bot._parse_javdb_actor_search("", "三上悠亜") is None
+
+
+def test_parse_javdb_actor_codes_dedupes_and_limits():
+    assert bot._parse_javdb_actor_codes(JAVDB_ACTOR_PAGE_HTML, 5) == [
+        "OFJE-712",
+        "OFJE-659",
+    ]
+    assert bot._parse_javdb_actor_codes("", 5) == []
+
+
+def test_parse_javdatabase_actor_slug():
+    assert bot._parse_javdatabase_actor_slug(JAVDATABASE_SEARCH_HTML, "Yui Hatano") == "yui-hatano"
+    assert bot._parse_javdatabase_actor_slug(JAVDATABASE_SEARCH_HTML, "Other") == "yui-hatano"
+    assert bot._parse_javdatabase_actor_slug("", "Yui Hatano") is None
+
+
+def test_parse_javdatabase_top_movies():
+    movies = bot._parse_javdatabase_top_movies(JAVDATABASE_IDOL_HTML, 10)
+    assert len(movies) == 2
+    assert movies[0]["code"] == "MIRD-277"
+    assert movies[0]["title"] == "MOODYZ Bus Tour Title Here"
+    assert movies[0]["date"] == "2026-03-13"
+    assert movies[0]["cover"].endswith("mird00277ps.webp")
+    assert movies[1]["code"] == "PRED-884"
+    assert movies[1]["date"] == "2026-08-14"
+
+
+def test_format_av_actor_top_escapes_and_orders():
+    movies = [
+        {"code": "MIRD-277", "title": "MOODYZ <unsafe>", "date": "2026-03-13", "actor_display": "三上悠亜", "actor_romaji": "Yua Mikami"},
+        {"code": "PRED-884", "title": "PRED-884", "date": "", "actor_display": "三上悠亜", "actor_romaji": "Yua Mikami"},
+    ]
+    text = bot._format_av_actor_top(movies)
+    assert text.startswith("🎬 三上悠亜 最热门作品")
+    assert "1. <code>MIRD-277</code>（2026-03-13） MOODYZ &lt;unsafe&gt;" in text
+    assert "2. <code>PRED-884</code>" in text
+    assert bot._format_av_actor_top([]) == "🔎 没有找到该演员的作品。"
+
+
+def test_av_actor_route_handles_cjk_name(monkeypatch):
+    seen = []
+
+    async def fake_actor(msg, chat, context, name):
+        seen.append((msg.text, chat.id, name))
+
+    async def fake_cover(msg, chat, context, code):
+        raise AssertionError("CJK name must not route to cover lookup")
+
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
+    monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
+    monkeypatch.setattr(bot, "_av_actor_cmd", fake_actor)
+    monkeypatch.setattr(bot, "_av_cover_cmd", fake_cover)
+
+    msg = SimpleNamespace(
+        text="/av 三上悠亜",
+        caption=None,
+        message_id=10,
+        from_user=SimpleNamespace(id=1),
+        reply_to_message=None,
+    )
+    chat = SimpleNamespace(id=-100123, type=bot.ChatType.SUPERGROUP)
+    asyncio.run(
+        bot.av_cmd(
+            SimpleNamespace(effective_message=msg, effective_chat=chat),
+            SimpleNamespace(),
+        )
+    )
+    assert seen == [("/av 三上悠亜", -100123, "三上悠亜")]
+
+
+def test_av_actor_lookup_pipeline_uses_three_sources(monkeypatch):
+    """javdb 查演员页 → r18.dev 桥接英文名 → javdatabase 收藏排序。"""
+    calls = {"javdb": [], "r18": [], "jd": []}
+
+    async def fake_lookup_javdb_actor(name):
+        calls["javdb"].append(name)
+        return "/actors/Av2e", "三上悠亜"
+
+    async def fake_lookup_javdb_actor_codes(path, limit):
+        calls["javdb"].append(path)
+        return ["OFJE-712", "OFJE-659"]
+
+    async def fake_lookup_r18dev(dvd_id):
+        calls["r18"].append(dvd_id)
+        return "", "https://pics.dmm.co.jp/digital/video/demo/demopl.jpg", ["Yua Mikami"]
+
+    async def fake_lookup_javdatabase_actor_slug(romaji):
+        calls["jd"].append(romaji)
+        assert romaji == "Yua Mikami"
+        return "yua-mikami"
+
+    async def fake_lookup_javdatabase_top_movies(slug, limit):
+        calls["jd"].append(slug)
+        return [
+            {"code": "MIRD-277", "title": "Bus Tour", "date": "2026-03-13", "cover": ""},
+            {"code": "PRED-884", "title": "Graduation", "date": "2026-08-14", "cover": ""},
+        ]
+
+    monkeypatch.setattr(bot, "_lookup_javdb_actor", fake_lookup_javdb_actor)
+    monkeypatch.setattr(bot, "_lookup_javdb_actor_codes", fake_lookup_javdb_actor_codes)
+    monkeypatch.setattr(bot, "_lookup_r18dev_cover", fake_lookup_r18dev)
+    monkeypatch.setattr(bot, "_lookup_javdatabase_actor_slug", fake_lookup_javdatabase_actor_slug)
+    monkeypatch.setattr(bot, "_lookup_javdatabase_top_movies", fake_lookup_javdatabase_top_movies)
+
+    movies = asyncio.run(bot._lookup_actor_top_videos("三上悠亜"))
+    assert len(movies) == 2
+    assert movies[0]["actor_display"] == "三上悠亜"
+    assert movies[0]["actor_romaji"] == "Yua Mikami"
+    assert calls == {
+        "javdb": ["三上悠亜", "/actors/Av2e"],
+        "r18": ["OFJE-712", "OFJE-659"],
+        "jd": ["Yua Mikami", "yua-mikami"],
+    }
