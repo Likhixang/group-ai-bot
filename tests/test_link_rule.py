@@ -146,3 +146,19 @@ async def test_extract_first_link_from_message():
     msg_tl.entities = (ent_tl,)
     msg_tl.caption_entities = ()
     assert bot._extract_first_link_from_message(msg_tl) == "https://example.com/custom"
+
+
+@pytest.mark.asyncio
+async def test_luna_link_review_uses_minimal_prompt_and_luna_model(monkeypatch):
+    monkeypatch.setattr(bot, "_fetch_url_readable", AsyncMock(return_value="网站正文"))
+    ask = AsyncMock(return_value="锐评\n含屎量：42%")
+    monkeypatch.setattr(bot, "_ask_ai_once", ask)
+
+    result = await bot._review_link_content_with_luna("https://example.com")
+
+    assert result == "锐评\n含屎量：42%"
+    ask.assert_awaited_once_with(
+        [{"role": "user", "content": "锐评网站内容，评价含屎量：\n网站正文"}],
+        model_name=bot.LUNA_MODEL,
+        temperature=0.7,
+    )

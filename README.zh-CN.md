@@ -21,6 +21,7 @@ cp .env.example .env
 - （可选）`OAI_MODEL`
 - （可选）`IMAGE_MODEL` — 图片生成模型名（默认 gpt-image-2）
 - （可选）`IMAGE_EDIT_MODEL` — 图生图模型名（默认同 IMAGE_MODEL）
+- （可选）`GROK_IMAGE_MODEL` — `/gkimg` 图片生成模型名（默认 grok-imagine-image-2.0）
 - （可选）`IMAGE_ASPECT_RATIO` — 画幅：1:1 / 3:4 / 4:3 / 9:16 / 16:9
 
 - （可选）`MEMORY_MAX_TURNS`
@@ -61,6 +62,7 @@ docker compose logs -f group-ai-bot
 - `grokt 你的问题`（文本深度思考：`grok-4-1-thinking`）
 - `oai 你的问题` 或 `/oai 你的问题`（GPT 模型：`gpt-5.5`）
 - `img 你的描述词` 或 `/img 你的描述词`：用 `gpt-image-2` 生成图片
+- `/gkimg 你的描述词`：用 `grok-imagine-image-2.0` 生成图片
 - 回复机器人文字消息可继续文本上下文（不用前缀）
 - 回复机器人生成的图片并输入修改要求，会自动改图
 - `edit 修改要求` 或 `/edit 修改要求`：修改被回复的图片；也支持上传图片并在 caption 写改图要求

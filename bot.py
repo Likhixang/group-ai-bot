@@ -65,6 +65,7 @@ LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-5.6-luna").strip()
 LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
+GROK_IMAGE_MODEL = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-2.0").strip()
 # --- 图片生成 (AxonHub /v1/images/generations，OpenAI 兼容) ---
 # 文生图：POST {AI_BASE_URL}/images/generations
 # 图生图：同端点，附 image 字段（base64）
@@ -195,16 +196,11 @@ JAVDATABASE_USER_AGENT = FOURHOI_USER_AGENT
 AV_ACTOR_ROMJI_SAMPLE = 20
 AV_ACTOR_TOP_LIMIT = max(1, min(10, int(os.getenv("AV_ACTOR_TOP_LIMIT", "10"))))
 
-# --- 视频生成 (agnes-video-v2.0 异步任务 API) ---
-# 注意：创建任务可走 AxonHub，但取结果必须直连上游 —— AxonHub 会剥掉响应里的
-# 视频 url 字段，只回 status/progress/seconds/size，拿不到成片。
-VIDEO_MODEL = os.getenv("VIDEO_MODEL", "agnes-video-v2.0").strip()
-VIDEO_BASE_URL = os.getenv("VIDEO_BASE_URL", "https://apihub.agnes-ai.com").strip().rstrip("/")
-VIDEO_API_KEY = os.getenv("VIDEO_API_KEY", "").strip()
-VIDEO_NUM_FRAMES = int(os.getenv("VIDEO_NUM_FRAMES", "81"))   # 8n+1，<=441；81/24fps ≈ 3.4s
-VIDEO_FRAME_RATE = int(os.getenv("VIDEO_FRAME_RATE", "24"))
-VIDEO_WIDTH = int(os.getenv("VIDEO_WIDTH", "832"))
-VIDEO_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "448"))
+# --- 视频生成（AxonHub /v1/videos 异步任务 API）---
+VIDEO_MODEL = os.getenv("VIDEO_MODEL", "grok-imagine-video-1.5").strip()
+VIDEO_DURATION = max(1, min(15, int(os.getenv("VIDEO_DURATION", "8"))))
+VIDEO_ASPECT_RATIO = os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip()
+VIDEO_RESOLUTION = os.getenv("VIDEO_RESOLUTION", "720p").strip()
 VIDEO_POLL_INTERVAL = int(os.getenv("VIDEO_POLL_INTERVAL", "6"))
 VIDEO_POLL_TIMEOUT = int(os.getenv("VIDEO_POLL_TIMEOUT", "600"))
 WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
@@ -1263,9 +1259,19 @@ async def _ban_release_scheduler_loop(application: Application) -> None:
         await asyncio.sleep(BAN_CHECK_INTERVAL)
 
 
+def _image_request_command(raw_text: str) -> str:
+    text = (raw_text or "").strip()
+    if not text:
+        return ""
+    return text.partition(" ")[0].lower().lstrip("/").split("@", 1)[0]
+
+
 def _is_image_generation_request(raw_text: str) -> bool:
-    text = (raw_text or "").strip().lower()
-    return text.startswith("img ") or text.startswith("/img ")
+    return _image_request_command(raw_text) in {"img", "gkimg"}
+
+
+def _is_grok_image_generation_request(raw_text: str) -> bool:
+    return _image_request_command(raw_text) == "gkimg"
 
 
 def _is_image_edit_request(raw_text: str) -> bool:
@@ -1275,10 +1281,8 @@ def _is_image_edit_request(raw_text: str) -> bool:
 
 def _clean_image_prompt(raw_text: str) -> str:
     text = (raw_text or "").strip()
-    low = text.lower()
-    for prefix in ("/edit ", "/img ", "edit ", "img "):
-        if low.startswith(prefix):
-            return text[len(prefix):].strip()
+    if _image_request_command(text) in {"img", "gkimg", "edit"}:
+        return text.partition(" ")[2].strip()
     return text.strip()
 
 
@@ -2677,10 +2681,10 @@ def _extract_image_bytes(data: dict) -> bytes:
     return resp.content
 
 
-async def _generate_image(prompt: str) -> bytes:
+async def _generate_image(prompt: str, model: str = IMAGE_MODEL) -> bytes:
     base = AI_BASE_URL.rstrip("/")
     headers = {"Authorization": f"Bearer {AI_API_KEY}"}
-    payload = {"model": IMAGE_MODEL, "prompt": prompt, "n": 1, "size": "1024x1024"}
+    payload = {"model": model, "prompt": prompt, "n": 1, "size": "1024x1024"}
     last_exc = None
     for attempt in range(IMAGE_GEN_RETRIES + 1):
         try:
@@ -2869,12 +2873,14 @@ IMAGE_REFERENCE_GUIDE = (
 )
 
 
-async def _generate_image_with_reference(prompt: str, reference_bytes: bytes) -> bytes:
+async def _generate_image_with_reference(
+    prompt: str, reference_bytes: bytes, model: str = IMAGE_MODEL
+) -> bytes:
     """带参考图的文生图：参考图与提示词一起交给 image-2（复用 /images/edits）。"""
     return await _post_image_edits(
         IMAGE_REFERENCE_GUIDE + (prompt or ""),
         reference_bytes,
-        model=IMAGE_MODEL,
+        model=model,
         log_tag="image reference",
     )
 
@@ -2925,46 +2931,45 @@ async def _create_video_task(
     image_url: Optional[str] = None,
     image_bytes: Optional[bytes] = None,
 ) -> str:
-    """提交视频生成任务，返回 video_id。直连上游 Agnes。
-
-    image_bytes 走 data URL 提交（实测上游接受 data:image/...;base64,...），
-    所以不需要公网图床就能做图生视频。上游会自行转存并把 mode 设为 ti2vid。
-    """
+    """通过 AxonHub 提交 Grok Imagine 视频任务，返回 request_id。"""
     headers = {
-        "Authorization": f"Bearer {VIDEO_API_KEY}",
+        "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
         "model": VIDEO_MODEL,
         "prompt": prompt,
-        "width": VIDEO_WIDTH,
-        "height": VIDEO_HEIGHT,
-        "num_frames": VIDEO_NUM_FRAMES,
-        "frame_rate": VIDEO_FRAME_RATE,
+        "duration": VIDEO_DURATION,
+        "aspect_ratio": VIDEO_ASPECT_RATIO,
+        "resolution": VIDEO_RESOLUTION,
     }
     if image_bytes:
         mime = "image/png" if image_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
-        payload["image"] = f"data:{mime};base64," + base64.b64encode(image_bytes).decode()
+        payload["image"] = {
+            "url": f"data:{mime};base64," + base64.b64encode(image_bytes).decode()
+        }
     elif image_url:
-        payload["image"] = image_url
+        payload["image"] = {"url": image_url}
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(f"{VIDEO_BASE_URL}/v1/videos", headers=headers, json=payload)
+        resp = await client.post(
+            f"{AI_BASE_URL.rstrip('/')}/videos/generations",
+            headers=headers,
+            json=payload,
+        )
         if resp.status_code >= 400:
             raise RuntimeError(f"Video create HTTP {resp.status_code}: {resp.text[:500]}")
         data = resp.json()
-    vid = data.get("video_id") or data.get("task_id") or data.get("id")
+    vid = data.get("request_id") or data.get("video_id") or data.get("task_id") or data.get("id")
     if not vid:
         raise RuntimeError(f"Video create: no id in response {str(data)[:300]}")
     return vid
 
 
 async def _poll_video_result(video_id: str, on_progress=None) -> str:
-    """轮询任务直到完成，返回视频 URL。
-
-    URL 在响应顶层 `url` 字段 —— 官方文档写的 `metadata.url` 实际是空的。
-    """
-    headers = {"Authorization": f"Bearer {VIDEO_API_KEY}"}
-    url = f"{VIDEO_BASE_URL}/agnesapi?video_id={urllib.parse.quote(video_id)}"
+    """轮询 AxonHub 任务直到完成，返回受鉴权保护的视频内容 URL。"""
+    headers = {"Authorization": f"Bearer {AI_API_KEY}"}
+    base = AI_BASE_URL.rstrip("/")
+    url = f"{base}/videos/{urllib.parse.quote(video_id)}"
     deadline = time.time() + VIDEO_POLL_TIMEOUT
     last_progress = -1
     async with httpx.AsyncClient(timeout=60) as client:
@@ -2975,11 +2980,8 @@ async def _poll_video_result(video_id: str, on_progress=None) -> str:
             data = resp.json()
             status = (data.get("status") or "").lower()
             progress = data.get("progress") or 0
-            if status in {"completed", "succeeded", "success"}:
-                video_url = data.get("url") or (data.get("metadata") or {}).get("url")
-                if not video_url:
-                    raise RuntimeError(f"Video done but no url: {str(data)[:300]}")
-                return video_url
+            if status in {"done", "completed", "succeeded", "success"}:
+                return f"{base}/videos/{urllib.parse.quote(video_id)}/content"
             if status in {"failed", "error", "cancelled"}:
                 err = data.get("error") or status
                 raise RuntimeError(f"Video generation failed: {str(err)[:300]}")
@@ -2995,7 +2997,9 @@ async def _poll_video_result(video_id: str, on_progress=None) -> str:
 
 async def _download_video(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
-        resp = await client.get(url)
+        resp = await client.get(
+            url, headers={"Authorization": f"Bearer {AI_API_KEY}"}
+        )
         if resp.status_code >= 400:
             raise RuntimeError(f"Video download HTTP {resp.status_code}")
         return resp.content
@@ -3798,7 +3802,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
     await _reply_text_and_track(
         msg,
-        "已上线。发送：ds / gk / gm + 空格 + 问题；img + 提示词生成图片；回复图片用 edit + 要求改图；/av 番号查封面，回复图片发 /av 或图片 caption 写 /av 可检索番号。"
+        "已上线。发送：ds / gk / gm + 空格 + 问题；img + 提示词生成图片；gkimg + 提示词用 Grok 生成图片；回复图片用 edit + 要求改图；/av 番号查封面，回复图片发 /av 或图片 caption 写 /av 可检索番号。"
     )
 
 
@@ -3824,9 +3828,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"/lm 或 lm 你的问题 — 对话 ({LUMO_MODEL})\n"
             f"/ln 或 ln 你的问题 — 对话 ({LUNA_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
+            f"/gkimg 提示词 — 生成图片 ({GROK_IMAGE_MODEL})\n"
             "/edit 或 edit 要求 — 回复图片改图（或上传图+写 caption）\n"
             "/av 番号 — 查询封面（Fourhoi → R18.dev）；回复图片发 /av，或图片 caption 写 /av 检索番号（AVScan）\n"
-            "/vid 或 vid 描述 — 生成视频（约 3 秒，要等 1-2 分钟）\n"
+            f"/vid 或 vid 描述 — 生成视频 ({VIDEO_MODEL}，约 {VIDEO_DURATION} 秒)\n"
             "  回复图片或上传图片写 /vid 描述 — 图生视频\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
             "/ip IP地址 — 查 IP 纯净度评分（多源聚合）\n"
@@ -4882,6 +4887,7 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     override_text = context.user_data.pop("_image_prefix_text", None) if context.user_data is not None else None
     raw_text = override_text or _message_prompt_text(msg)
     is_generation = _is_image_generation_request(raw_text)
+    is_grok_generation = _is_grok_image_generation_request(raw_text)
     is_edit = _is_image_edit_request(raw_text)
     reply_image_file_id = _reply_image_target(msg)
     if is_edit and not reply_image_file_id:
@@ -4925,6 +4931,7 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     image_prompt = prompt
+    generation_model = GROK_IMAGE_MODEL if is_grok_generation else IMAGE_MODEL
 
     edit_file_id = None
     if is_edit:
@@ -4955,10 +4962,12 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     image_prompt[:100],
                     len(reference_bytes),
                 )
-                image_bytes = await _generate_image_with_reference(final_prompt, reference_bytes)
+                image_bytes = await _generate_image_with_reference(
+                    final_prompt, reference_bytes, model=generation_model
+                )
             else:
-                image_bytes = await _generate_image(final_prompt)
-            model_name = IMAGE_MODEL
+                image_bytes = await _generate_image(final_prompt, model=generation_model)
+            model_name = generation_model
         caption = (
             f"<blockquote>模型: {escape(model_name)}</blockquote>\n"
             f"<blockquote>提示词: {escape(final_prompt[:850])}</blockquote>"
@@ -5005,9 +5014,6 @@ async def video_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _reply_not_allowed_and_cleanup(msg, context)
             return
 
-    if not VIDEO_API_KEY:
-        await _reply_text_and_track(msg, "视频功能没配置好（缺 VIDEO_API_KEY）。")
-        return
 
     override_text = context.user_data.pop("_video_prefix_text", None) if context.user_data is not None else None
     prompt = _clean_video_prompt(override_text or _message_prompt_text(msg))
@@ -5022,7 +5028,7 @@ async def video_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     source_file_id = _video_source_image(msg)
 
-    seconds = VIDEO_NUM_FRAMES / VIDEO_FRAME_RATE
+    seconds = VIDEO_DURATION
     mode_label = "图生视频" if source_file_id else "生成视频"
     status = await _reply_text_and_track(
         msg, f"{mode_label}中... 约 {seconds:.1f} 秒时长，通常要等 1-2 分钟。"
@@ -5706,46 +5712,26 @@ def _format_luna_link_review(raw_review: str) -> str:
 
 
 async def _review_link_content_with_luna(url: str) -> str:
-    """Fetch URL content via reader and call Luna to evaluate summary and gold/crap percentage."""
+    """Fetch URL content and ask Luna for a sharp review plus shit-content score."""
     content = ""
     try:
         content = await _fetch_url_readable(url)
     except Exception as exc:
         logger.warning("Failed to fetch link content for %s: %s", url, exc)
 
-    prompt_content = content[:WEB_FETCH_MAX_CHARS] if content else f"链接：{url}（无法直接抓取网页正文，请根据网址域名和链接特征品鉴）"
-
-    prompt = (
-        f"群友在群里发了个网站/链接，你打开瞅一眼，用群友吹水聊天的口吻给大伙品鉴一下这网站到底是个啥东西：\n\n"
-        f"链接地址: {url}\n"
-        f"网站打开后的内容:\n{prompt_content}\n\n"
-        f"注意：\n"
-        f"1. 这可能是一个项目、工具、官网、社区帖子、论坛、下载站、商城或者各种服务，不要预设它是一篇“文章”，管它是不是文章干嘛！直接说这网站打开是干什么的、有什么功能/卖点/内容、值不值得看、是不是坑。\n"
-        f"2. 说话必须是真人聊天口吻，拒绝死板公文和AI味，口语化、接地气、短小精炼，一针见血。\n"
-        f"3. 评完之后，另起一行给出你对这个网站/链接内容的「含屎量」打分（0-100%），格式固定为：\n"
-        f"含屎量：X%\n"
-        f"（不要提含金量，不要写多余的评分解释，这一行就只要含屎量）。"
-    )
-
+    prompt_content = content[:WEB_FETCH_MAX_CHARS] if content else url
     messages = [
         {
-            "role": "system",
-            "content": (
-                "你叫 Luna，是 Telegram 群里一个见多识广、说话尖锐刻薄又幽默的资深老司机群友。\n"
-                "你的任务是帮群友品鉴大家发出来的各种网站链接（包括但不限于开源项目、在线工具、软件官网、论坛讨论、营销页面、奇怪服务等）：\n"
-                "1. 严禁把所有链接都当成“文章”或“作者写的文章”来总结！直接品鉴这个网站/页面到底是个啥、有什么用、是正经好东西还是工业垃圾/坑爹玩意。\n"
-                "2. 说话是地道的真人网络聊天口吻，口语化、短句、毒舌幽默，绝不端着，绝不要出现“本文介绍了”、“作者阐述了”这种机器人套话。\n"
-                "3. 最后一行必须单独输出含屎量：含屎量：X%（X为0-100的数值）。"
-            ),
-        },
-        {"role": "user", "content": prompt},
+            "role": "user",
+            "content": f"锐评网站内容，评价含屎量：\n{prompt_content}",
+        }
     ]
 
     return await _ask_ai_once(messages, model_name=LUNA_MODEL, temperature=0.7)
 
 
 async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """全群链接检测：调用 Luna 评价链接内容并总结输出含金量与含屎量（超管豁免）。"""
+    """全群链接检测：调用 Luna 锐评网站内容并输出含屎量（超管豁免）。"""
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
@@ -7048,6 +7034,7 @@ async def post_init(application: Application) -> None:
         BotCommand("lm", f"对话 ({LUMO_MODEL})"),
         BotCommand("ln", f"对话 ({LUNA_MODEL})"),
         BotCommand("img", "生成图片"),
+        BotCommand("gkimg", f"生成图片 ({GROK_IMAGE_MODEL})"),
         BotCommand("edit", "修改图片"),
         BotCommand("av", "番号查 R18.dev 封面；图片检索 AVScan"),
         BotCommand("vid", "生成视频"),
@@ -7130,7 +7117,7 @@ def main() -> None:
     app.add_handler(CommandHandler("force_stop", force_stop_cmd))
     app.add_handler(CommandHandler("pin", pin_cmd))
     app.add_handler(CommandHandler("unpin", unpin_cmd))
-    app.add_handler(CommandHandler(["img", "edit"], image_cmd))
+    app.add_handler(CommandHandler(["img", "gkimg", "edit"], image_cmd))
     app.add_handler(CommandHandler("av", av_cmd))
     app.add_handler(CommandHandler("vid", video_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))

@@ -14,6 +14,7 @@ os.environ.setdefault("AI_THINKING_MODEL", "deepseek-v4-pro")
 os.environ.setdefault("OAI_MODEL", "gpt-5.5")
 os.environ.setdefault("IMAGE_MODEL", "gpt-image-2")
 os.environ.setdefault("IMAGE_EDIT_MODEL", "gpt-image-2")
+os.environ.setdefault("GROK_IMAGE_MODEL", "grok-imagine-image-2.0")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 bot = importlib.import_module("bot")
@@ -22,6 +23,7 @@ bot = importlib.import_module("bot")
 def test_clean_image_prompt_removes_img_and_edit_prefixes():
     assert bot._clean_image_prompt("img 画一只猫") == "画一只猫"
     assert bot._clean_image_prompt("/img 画一只猫") == "画一只猫"
+    assert bot._clean_image_prompt("/gkimg 画一只猫") == "画一只猫"
     assert bot._clean_image_prompt("edit 改成夜景") == "改成夜景"
     assert bot._clean_image_prompt("/edit 改成夜景") == "改成夜景"
 
@@ -76,6 +78,9 @@ def test_clean_prompt_and_select_text_model_for_lm():
 def test_image_request_detection_handles_prefixes_and_commands():
     assert bot._is_image_generation_request("img 赛博朋克城市") is True
     assert bot._is_image_generation_request("/img 赛博朋克城市") is True
+    assert bot._is_image_generation_request("/gkimg 赛博朋克城市") is True
+    assert bot._is_image_generation_request("/gkimg@any_bot 赛博朋克城市") is True
+    assert bot._is_grok_image_generation_request("/gkimg 赛博朋克城市") is True
     assert bot._is_image_generation_request("ds img 赛博朋克城市") is False
     assert bot._is_image_edit_request("edit 改成水彩") is True
     assert bot._is_image_edit_request("/edit 改成水彩") is True
@@ -479,11 +484,13 @@ def test_reference_generation_and_edit_use_shared_edits_pipeline(monkeypatch):
 
     monkeypatch.setattr(bot, "_post_image_edits", fake_post)
 
-    assert asyncio.run(bot._generate_image_with_reference("画一只猫", b"ref")) == b"final-image"
+    assert asyncio.run(
+        bot._generate_image_with_reference("画一只猫", b"ref", model="grok-image")
+    ) == b"final-image"
     assert captured[-1] == (
         bot.IMAGE_REFERENCE_GUIDE + "画一只猫",
         b"ref",
-        bot.IMAGE_MODEL,
+        "grok-image",
         "image reference",
     )
 
@@ -534,6 +541,86 @@ def test_post_image_edits_builds_multipart_request(monkeypatch):
     asyncio.run(bot._post_image_edits("hi", jpg_bytes, model="m2", log_tag="tag"))
     assert captured["files"]["image"][0] == "input.jpg"
     assert captured["files"]["image"][2] == "image/jpeg"
+
+
+def test_generate_image_uses_requested_model(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"b64_json": base64.b64encode(b"png-bytes").decode()}]}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            captured.update(url=url, headers=headers, json=json)
+            return FakeResponse()
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(bot, "AI_BASE_URL", "https://api.example/v1")
+
+    out = asyncio.run(
+        bot._generate_image("画一只猫", model="grok-imagine-image-2.0")
+    )
+
+    assert out == b"png-bytes"
+    assert captured["url"] == "https://api.example/v1/images/generations"
+    assert captured["json"] == {
+        "model": "grok-imagine-image-2.0",
+        "prompt": "画一只猫",
+        "n": 1,
+        "size": "1024x1024",
+    }
+
+
+def test_create_grok_video_task_uses_axonhub_contract(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"request_id": "video-test"}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            captured.update(url=url, headers=headers, json=json)
+            return FakeResponse()
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(bot, "AI_BASE_URL", "https://api.example/v1")
+    monkeypatch.setattr(bot, "VIDEO_MODEL", "grok-imagine-video-1.5")
+
+    result = asyncio.run(bot._create_video_task("让云层缓慢移动"))
+
+    assert result == "video-test"
+    assert captured["url"] == "https://api.example/v1/videos/generations"
+    assert captured["json"] == {
+        "model": "grok-imagine-video-1.5",
+        "prompt": "让云层缓慢移动",
+        "duration": bot.VIDEO_DURATION,
+        "aspect_ratio": bot.VIDEO_ASPECT_RATIO,
+        "resolution": bot.VIDEO_RESOLUTION,
+    }
 
 
 JAVDB_ACTOR_SEARCH_HTML = """
