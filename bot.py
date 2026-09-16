@@ -66,9 +66,10 @@ LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
 GROK_IMAGE_MODEL = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-2.0").strip()
-GROK_MEDIA_BASE_URL = os.getenv(
-    "GROK_MEDIA_BASE_URL", "http://grok2api:8000"
+GROK_API_BASE_URL = os.getenv(
+    "GROK_API_BASE_URL", "https://api.215102.xyz/v1"
 ).strip().rstrip("/")
+GROK_API_KEY = os.getenv("GROK_API_KEY", "").strip()
 # --- 图片生成 (AxonHub /v1/images/generations，OpenAI 兼容) ---
 # 文生图：POST {AI_BASE_URL}/images/generations
 # 图生图：同端点，附 image 字段（base64）
@@ -199,7 +200,7 @@ JAVDATABASE_USER_AGENT = FOURHOI_USER_AGENT
 AV_ACTOR_ROMJI_SAMPLE = 20
 AV_ACTOR_TOP_LIMIT = max(1, min(10, int(os.getenv("AV_ACTOR_TOP_LIMIT", "10"))))
 
-# --- 视频生成（AxonHub /v1/videos 异步任务 API）---
+# --- Grok 视频生成（独立 Sub2API 异步任务 API）---
 VIDEO_MODEL = os.getenv("VIDEO_MODEL", "grok-imagine-video-1.5").strip()
 VIDEO_DURATION = max(1, min(15, int(os.getenv("VIDEO_DURATION", "8"))))
 VIDEO_ASPECT_RATIO = os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip()
@@ -2711,29 +2712,16 @@ async def _generate_image(prompt: str, model: str = IMAGE_MODEL) -> bytes:
             raise
 
 
-GROK_IMAGE_MARKDOWN_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
-
-
-def _grok_media_url(raw_url: str) -> str:
-    """Map grok2api loopback media URLs to its docker_share hostname."""
-    value = (raw_url or "").strip()
-    parsed = urllib.parse.urlsplit(value)
-    if parsed.hostname not in {"127.0.0.1", "localhost"}:
-        return value
-    suffix = parsed.path
-    if parsed.query:
-        suffix += f"?{parsed.query}"
-    return f"{GROK_MEDIA_BASE_URL}{suffix}"
-
-
 async def _generate_grok_image(prompt: str) -> bytes:
-    """Generate through grok2api's chat-compatible image route."""
-    base = AI_BASE_URL.rstrip("/")
-    headers = {"Authorization": f"Bearer {AI_API_KEY}"}
+    """Generate an image through the dedicated Grok Sub2API endpoint."""
+    if not GROK_API_KEY:
+        raise RuntimeError("GROK_API_KEY is not configured")
+    headers = {"Authorization": f"Bearer {GROK_API_KEY}"}
     payload = {
         "model": GROK_IMAGE_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
+        "prompt": prompt,
+        "n": 1,
+        "size": "1024x1024",
     }
     for attempt in range(IMAGE_GEN_RETRIES + 1):
         try:
@@ -2741,22 +2729,24 @@ async def _generate_grok_image(prompt: str) -> bytes:
                 timeout=IMAGE_GEN_TIMEOUT, follow_redirects=True
             ) as client:
                 resp = await client.post(
-                    f"{base}/chat/completions", headers=headers, json=payload
+                    f"{GROK_API_BASE_URL}/images/generations",
+                    headers=headers,
+                    json=payload,
                 )
                 if resp.status_code >= 400:
                     raise RuntimeError(
                         f"Grok image HTTP {resp.status_code}: {resp.text[:500]}"
                     )
-                choices = resp.json().get("choices") or []
-                content = (
-                    ((choices[0] or {}).get("message") or {}).get("content")
-                    if choices
-                    else ""
-                )
-                match = GROK_IMAGE_MARKDOWN_RE.search(content or "")
-                if not match:
+                data = resp.json().get("data") or []
+                if not data:
+                    raise RuntimeError("Grok image response contains no data")
+                first = data[0] or {}
+                if first.get("b64_json"):
+                    return base64.b64decode(first["b64_json"])
+                image_url = first.get("url")
+                if not image_url:
                     raise RuntimeError("Grok image response contains no image URL")
-                image_resp = await client.get(_grok_media_url(match.group(1)))
+                image_resp = await client.get(image_url)
                 if image_resp.status_code >= 400:
                     raise RuntimeError(
                         f"Grok image download HTTP {image_resp.status_code}"
@@ -3001,9 +2991,11 @@ async def _create_video_task(
     image_url: Optional[str] = None,
     image_bytes: Optional[bytes] = None,
 ) -> str:
-    """通过 AxonHub 提交 Grok Imagine 视频任务，返回 request_id。"""
+    """通过独立 Grok Sub2API 提交视频任务，返回 request_id。"""
+    if not GROK_API_KEY:
+        raise RuntimeError("GROK_API_KEY is not configured")
     headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
+        "Authorization": f"Bearer {GROK_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -3022,7 +3014,7 @@ async def _create_video_task(
         payload["image"] = {"url": image_url}
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            f"{AI_BASE_URL.rstrip('/')}/videos/generations",
+            f"{GROK_API_BASE_URL}/videos/generations",
             headers=headers,
             json=payload,
         )
@@ -3036,10 +3028,10 @@ async def _create_video_task(
 
 
 async def _poll_video_result(video_id: str, on_progress=None) -> str:
-    """轮询 AxonHub 任务直到完成，返回受鉴权保护的视频内容 URL。"""
-    headers = {"Authorization": f"Bearer {AI_API_KEY}"}
-    base = AI_BASE_URL.rstrip("/")
-    url = f"{base}/videos/{urllib.parse.quote(video_id)}"
+    """轮询 Grok Sub2API 任务直到完成，返回受鉴权保护的内容 URL。"""
+    headers = {"Authorization": f"Bearer {GROK_API_KEY}"}
+    task_id = urllib.parse.quote(video_id, safe="")
+    url = f"{GROK_API_BASE_URL}/videos/generations/{task_id}"
     deadline = time.time() + VIDEO_POLL_TIMEOUT
     last_progress = -1
     async with httpx.AsyncClient(timeout=60) as client:
@@ -3051,8 +3043,8 @@ async def _poll_video_result(video_id: str, on_progress=None) -> str:
             status = (data.get("status") or "").lower()
             progress = data.get("progress") or 0
             if status in {"done", "completed", "succeeded", "success"}:
-                return f"{base}/videos/{urllib.parse.quote(video_id)}/content"
-            if status in {"failed", "error", "cancelled"}:
+                return f"{GROK_API_BASE_URL}/videos/generations/{task_id}/content"
+            if status in {"failed", "error", "cancelled", "expired"}:
                 err = data.get("error") or status
                 raise RuntimeError(f"Video generation failed: {str(err)[:300]}")
             if on_progress and progress != last_progress:
@@ -3068,7 +3060,7 @@ async def _poll_video_result(video_id: str, on_progress=None) -> str:
 async def _download_video(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
         resp = await client.get(
-            url, headers={"Authorization": f"Bearer {AI_API_KEY}"}
+            url, headers={"Authorization": f"Bearer {GROK_API_KEY}"}
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"Video download HTTP {resp.status_code}")
@@ -5021,8 +5013,8 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             image_bytes = await _edit_image(final_prompt, source_bytes)
             model_name = IMAGE_EDIT_MODEL
         elif is_grok_generation:
-            # Grok Imagine's chat-compatible route accepts text only. Do not
-            # reuse /img's searched-reference /images/edits pipeline here.
+            # /gkimg has its own provider and does not reuse /img's reference
+            # search/edit path.
             final_prompt = await _expand_image_prompt(image_prompt)
             image_bytes = await _generate_grok_image(final_prompt)
             model_name = GROK_IMAGE_MODEL
@@ -5082,6 +5074,10 @@ async def video_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
+        return
+
+    if not GROK_API_KEY:
+        await _reply_text_and_track(msg, "Grok 媒体服务没配置好（缺 GROK_API_KEY）。")
         return
 
     uid = msg.from_user.id if msg.from_user else None

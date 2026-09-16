@@ -15,6 +15,8 @@ os.environ.setdefault("OAI_MODEL", "gpt-5.5")
 os.environ.setdefault("IMAGE_MODEL", "gpt-image-2")
 os.environ.setdefault("IMAGE_EDIT_MODEL", "gpt-image-2")
 os.environ.setdefault("GROK_IMAGE_MODEL", "grok-imagine-image-2.0")
+os.environ.setdefault("GROK_API_BASE_URL", "https://grok.example/v1")
+os.environ.setdefault("GROK_API_KEY", "test-grok-key")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 bot = importlib.import_module("bot")
@@ -583,7 +585,7 @@ def test_generate_image_uses_requested_model(monkeypatch):
     }
 
 
-def test_generate_grok_image_uses_chat_api_and_rewrites_loopback_media(monkeypatch):
+def test_generate_grok_image_uses_dedicated_images_api(monkeypatch):
     calls = []
 
     class FakeResponse:
@@ -608,42 +610,31 @@ def test_generate_grok_image_uses_chat_api_and_rewrites_loopback_media(monkeypat
 
         async def post(self, url, headers=None, json=None):
             calls.append(("post", url, headers, json))
-            return FakeResponse(
-                payload={
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "![image](http://127.0.0.1:8000/v1/media/images/img_test)"
-                            }
-                        }
-                    ]
-                }
-            )
+            return FakeResponse(payload={"data": [{"url": "https://cdn.example/img.jpg"}]})
 
         async def get(self, url):
             calls.append(("get", url))
             return FakeResponse(content=b"grok-image")
 
     monkeypatch.setattr(bot.httpx, "AsyncClient", FakeClient)
-    monkeypatch.setattr(bot, "AI_BASE_URL", "https://api.example/v1")
-    monkeypatch.setattr(bot, "GROK_MEDIA_BASE_URL", "http://grok2api:8000")
+    monkeypatch.setattr(bot, "GROK_API_BASE_URL", "https://grok.example/v1")
+    monkeypatch.setattr(bot, "GROK_API_KEY", "test-grok-key")
 
     out = asyncio.run(bot._generate_grok_image("画一只猫"))
 
     assert out == b"grok-image"
-    assert calls[1][0:2] == ("post", "https://api.example/v1/chat/completions")
+    assert calls[1][0:2] == ("post", "https://grok.example/v1/images/generations")
+    assert calls[1][2]["Authorization"] == "Bearer test-grok-key"
     assert calls[1][3] == {
         "model": "grok-imagine-image-2.0",
-        "messages": [{"role": "user", "content": "画一只猫"}],
-        "stream": False,
+        "prompt": "画一只猫",
+        "n": 1,
+        "size": "1024x1024",
     }
-    assert calls[2] == (
-        "get",
-        "http://grok2api:8000/v1/media/images/img_test",
-    )
+    assert calls[2] == ("get", "https://cdn.example/img.jpg")
 
 
-def test_create_grok_video_task_uses_axonhub_contract(monkeypatch):
+def test_create_grok_video_task_uses_dedicated_api_contract(monkeypatch):
     captured = {}
 
     class FakeResponse:
@@ -667,13 +658,15 @@ def test_create_grok_video_task_uses_axonhub_contract(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setattr(bot.httpx, "AsyncClient", FakeClient)
-    monkeypatch.setattr(bot, "AI_BASE_URL", "https://api.example/v1")
+    monkeypatch.setattr(bot, "GROK_API_BASE_URL", "https://grok.example/v1")
+    monkeypatch.setattr(bot, "GROK_API_KEY", "test-grok-key")
     monkeypatch.setattr(bot, "VIDEO_MODEL", "grok-imagine-video-1.5")
 
     result = asyncio.run(bot._create_video_task("让云层缓慢移动"))
 
     assert result == "video-test"
-    assert captured["url"] == "https://api.example/v1/videos/generations"
+    assert captured["url"] == "https://grok.example/v1/videos/generations"
+    assert captured["headers"]["Authorization"] == "Bearer test-grok-key"
     assert captured["json"] == {
         "model": "grok-imagine-video-1.5",
         "prompt": "让云层缓慢移动",
@@ -681,6 +674,60 @@ def test_create_grok_video_task_uses_axonhub_contract(monkeypatch):
         "aspect_ratio": bot.VIDEO_ASPECT_RATIO,
         "resolution": bot.VIDEO_RESOLUTION,
     }
+
+
+def test_poll_and_download_grok_video_use_dedicated_api(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def __init__(self, *, payload=None, content=b""):
+            self._payload = payload
+            self.content = content
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            calls.append(("get", url, headers))
+            if url.endswith("/content"):
+                return FakeResponse(content=b"video-bytes")
+            return FakeResponse(payload={"status": "done", "progress": 100})
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(bot, "GROK_API_BASE_URL", "https://grok.example/v1")
+    monkeypatch.setattr(bot, "GROK_API_KEY", "test-grok-key")
+
+    content_url = asyncio.run(bot._poll_video_result("task/with slash"))
+    content = asyncio.run(bot._download_video(content_url))
+
+    assert content_url == (
+        "https://grok.example/v1/videos/generations/task%2Fwith%20slash/content"
+    )
+    assert content == b"video-bytes"
+    get_calls = [call for call in calls if call[0] == "get"]
+    assert get_calls[0] == (
+        "get",
+        "https://grok.example/v1/videos/generations/task%2Fwith%20slash",
+        {"Authorization": "Bearer test-grok-key"},
+    )
+    assert get_calls[1] == (
+        "get",
+        content_url,
+        {"Authorization": "Bearer test-grok-key"},
+    )
 
 
 JAVDB_ACTOR_SEARCH_HTML = """
