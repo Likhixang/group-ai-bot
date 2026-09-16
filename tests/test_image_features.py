@@ -634,6 +634,58 @@ def test_generate_grok_image_uses_dedicated_images_api(monkeypatch):
     assert calls[2] == ("get", "https://cdn.example/img.jpg")
 
 
+def test_gkimg_command_sends_raw_user_prompt_without_expansion(monkeypatch):
+    seen = []
+
+    async def fail_expand(prompt):
+        raise AssertionError("/gkimg must not expand the user prompt")
+
+    async def fake_generate(prompt):
+        seen.append(prompt)
+        return b"jpeg-bytes"
+
+    async def fake_reply_text(msg, text, **kwargs):
+        return SimpleNamespace(chat_id=-100123, message_id=101)
+
+    async def fake_reply_photo(*, photo, caption, parse_mode):
+        assert photo.read() == b"jpeg-bytes"
+        assert "一只猫" in caption
+
+    async def fake_delete_message(**kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_expand_image_prompt", fail_expand)
+    monkeypatch.setattr(bot, "_generate_grok_image", fake_generate)
+    monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
+    monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
+
+    msg = SimpleNamespace(
+        text="/gkimg 一只猫",
+        caption=None,
+        message_id=100,
+        from_user=SimpleNamespace(id=1),
+        reply_to_message=None,
+        photo=None,
+        document=None,
+        reply_photo=fake_reply_photo,
+    )
+    chat = SimpleNamespace(id=-100123, type=bot.ChatType.SUPERGROUP)
+    context = SimpleNamespace(
+        user_data={},
+        bot=SimpleNamespace(delete_message=fake_delete_message),
+    )
+
+    asyncio.run(
+        bot.on_image_request(
+            SimpleNamespace(effective_message=msg, effective_chat=chat),
+            context,
+        )
+    )
+
+    assert seen == ["一只猫"]
+
+
 def test_create_grok_video_task_uses_dedicated_api_contract(monkeypatch):
     captured = {}
 

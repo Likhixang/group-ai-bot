@@ -5014,8 +5014,9 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             model_name = IMAGE_EDIT_MODEL
         elif is_grok_generation:
             # /gkimg has its own provider and does not reuse /img's reference
-            # search/edit path.
-            final_prompt = await _expand_image_prompt(image_prompt)
+            # search/edit path. Send the user's prompt verbatim because xAI
+            # can reject some Luna-expanded prompts with HTTP 400.
+            final_prompt = image_prompt
             image_bytes = await _generate_grok_image(final_prompt)
             model_name = GROK_IMAGE_MODEL
         else:
