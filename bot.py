@@ -66,6 +66,9 @@ LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
 GROK_IMAGE_MODEL = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-2.0").strip()
+GROK_MEDIA_BASE_URL = os.getenv(
+    "GROK_MEDIA_BASE_URL", "http://grok2api:8000"
+).strip().rstrip("/")
 # --- 图片生成 (AxonHub /v1/images/generations，OpenAI 兼容) ---
 # 文生图：POST {AI_BASE_URL}/images/generations
 # 图生图：同端点，附 image 字段（base64）
@@ -2708,6 +2711,73 @@ async def _generate_image(prompt: str, model: str = IMAGE_MODEL) -> bytes:
             raise
 
 
+GROK_IMAGE_MARKDOWN_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+
+
+def _grok_media_url(raw_url: str) -> str:
+    """Map grok2api loopback media URLs to its docker_share hostname."""
+    value = (raw_url or "").strip()
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.hostname not in {"127.0.0.1", "localhost"}:
+        return value
+    suffix = parsed.path
+    if parsed.query:
+        suffix += f"?{parsed.query}"
+    return f"{GROK_MEDIA_BASE_URL}{suffix}"
+
+
+async def _generate_grok_image(prompt: str) -> bytes:
+    """Generate through grok2api's chat-compatible image route."""
+    base = AI_BASE_URL.rstrip("/")
+    headers = {"Authorization": f"Bearer {AI_API_KEY}"}
+    payload = {
+        "model": GROK_IMAGE_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+    for attempt in range(IMAGE_GEN_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(
+                timeout=IMAGE_GEN_TIMEOUT, follow_redirects=True
+            ) as client:
+                resp = await client.post(
+                    f"{base}/chat/completions", headers=headers, json=payload
+                )
+                if resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"Grok image HTTP {resp.status_code}: {resp.text[:500]}"
+                    )
+                choices = resp.json().get("choices") or []
+                content = (
+                    ((choices[0] or {}).get("message") or {}).get("content")
+                    if choices
+                    else ""
+                )
+                match = GROK_IMAGE_MARKDOWN_RE.search(content or "")
+                if not match:
+                    raise RuntimeError("Grok image response contains no image URL")
+                image_resp = await client.get(_grok_media_url(match.group(1)))
+                if image_resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"Grok image download HTTP {image_resp.status_code}"
+                    )
+                if not image_resp.content:
+                    raise RuntimeError("Grok image download returned empty content")
+                return image_resp.content
+        except Exception as exc:
+            if attempt < IMAGE_GEN_RETRIES:
+                logger.warning(
+                    "grok image attempt %s/%s failed (%s), retrying in %ss...",
+                    attempt + 1,
+                    IMAGE_GEN_RETRIES + 1,
+                    exc,
+                    IMAGE_GEN_RETRY_DELAY * (attempt + 1),
+                )
+                await asyncio.sleep(IMAGE_GEN_RETRY_DELAY * (attempt + 1))
+                continue
+            raise
+
+
 # 图像编辑引导语：标准 OpenAI /images/edits 接口，multipart/form-data 上传原图。
 # 配合提示词强调保留原图构图与主体，只按用户要求做局部改动。
 IMAGE_EDIT_GUIDE = (
@@ -4950,6 +5020,12 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             final_prompt = await _expand_image_edit_prompt(image_prompt)
             image_bytes = await _edit_image(final_prompt, source_bytes)
             model_name = IMAGE_EDIT_MODEL
+        elif is_grok_generation:
+            # Grok Imagine's chat-compatible route accepts text only. Do not
+            # reuse /img's searched-reference /images/edits pipeline here.
+            final_prompt = await _expand_image_prompt(image_prompt)
+            image_bytes = await _generate_grok_image(final_prompt)
+            model_name = GROK_IMAGE_MODEL
         else:
             # 提示词扩写与参考图并行准备；参考图缺失时回退纯文本生成。
             final_prompt, reference_bytes = await asyncio.gather(

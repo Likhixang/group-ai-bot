@@ -583,6 +583,66 @@ def test_generate_image_uses_requested_model(monkeypatch):
     }
 
 
+def test_generate_grok_image_uses_chat_api_and_rewrites_loopback_media(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, *, payload=None, content=b""):
+            self.status_code = 200
+            self._payload = payload
+            self.content = content
+            self.text = ""
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            calls.append(("post", url, headers, json))
+            return FakeResponse(
+                payload={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "![image](http://127.0.0.1:8000/v1/media/images/img_test)"
+                            }
+                        }
+                    ]
+                }
+            )
+
+        async def get(self, url):
+            calls.append(("get", url))
+            return FakeResponse(content=b"grok-image")
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(bot, "AI_BASE_URL", "https://api.example/v1")
+    monkeypatch.setattr(bot, "GROK_MEDIA_BASE_URL", "http://grok2api:8000")
+
+    out = asyncio.run(bot._generate_grok_image("画一只猫"))
+
+    assert out == b"grok-image"
+    assert calls[1][0:2] == ("post", "https://api.example/v1/chat/completions")
+    assert calls[1][3] == {
+        "model": "grok-imagine-image-2.0",
+        "messages": [{"role": "user", "content": "画一只猫"}],
+        "stream": False,
+    }
+    assert calls[2] == (
+        "get",
+        "http://grok2api:8000/v1/media/images/img_test",
+    )
+
+
 def test_create_grok_video_task_uses_axonhub_contract(monkeypatch):
     captured = {}
 
