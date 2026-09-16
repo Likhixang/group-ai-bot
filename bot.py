@@ -3067,6 +3067,14 @@ async def _download_video(url: str) -> bytes:
         return resp.content
 
 
+def _video_failure_message(exc: Exception) -> str:
+    """Return a useful Telegram error without exposing provider internals."""
+    detail = str(exc).lower()
+    if "content_policy_violation" in detail or "内容审计" in detail:
+        return "视频生成被上游内容审计拒绝，请调整提示词或图片后重试。"
+    return "视频生成失败，请稍后再试。"
+
+
 async def _download_telegram_file(
     context: ContextTypes.DEFAULT_TYPE,
     file_id: str,
@@ -5142,16 +5150,17 @@ async def video_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "video_response_complete: chat=%s msg=%s id=%s bytes=%s",
             chat.id, msg.message_id, video_id, len(video_bytes),
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("video request failed")
+        failure_text = _video_failure_message(exc)
         try:
             await context.bot.edit_message_text(
                 chat_id=status.chat_id,
                 message_id=status.message_id,
-                text="视频生成失败，请稍后再试。",
+                text=failure_text,
             )
         except Exception:
-            await _reply_text_and_track(msg, "视频生成失败，请稍后再试。")
+            await _reply_text_and_track(msg, failure_text)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

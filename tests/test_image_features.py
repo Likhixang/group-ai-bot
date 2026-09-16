@@ -782,6 +782,18 @@ def test_poll_and_download_grok_video_use_dedicated_api(monkeypatch):
     )
 
 
+def test_video_failure_message_distinguishes_content_policy():
+    assert bot._video_failure_message(
+        RuntimeError(
+            'Video create HTTP 403: {"type":"content_policy_violation",'
+            '"message":"内容审计命中风险规则"}'
+        )
+    ) == "视频生成被上游内容审计拒绝，请调整提示词或图片后重试。"
+    assert bot._video_failure_message(
+        RuntimeError("Video create HTTP 502")
+    ) == "视频生成失败，请稍后再试。"
+
+
 JAVDB_ACTOR_SEARCH_HTML = """
 <div class="box actor-box">
   <a href="/actors/Av2e" title="三上悠亜, 三上悠亞, 鬼头桃菜">
