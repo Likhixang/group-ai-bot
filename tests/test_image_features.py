@@ -854,6 +854,17 @@ def test_parse_javdb_actor_codes_dedupes_and_limits():
     assert bot._parse_javdb_actor_codes("", 5) == []
 
 
+def test_parse_javdb_actor_romaji_hints_from_social_handles():
+    html = """
+    <a href="https://twitter.com/yua_mikami">Twitter</a>
+    <a href="https://instagram.com/_aoi.tsukasa_">Instagram</a>
+    """
+    assert bot._parse_javdb_actor_romaji_hints(html) == [
+        "yua mikami",
+        "aoi tsukasa",
+    ]
+
+
 def test_parse_javdatabase_actor_slug():
     assert bot._parse_javdatabase_actor_slug(JAVDATABASE_SEARCH_HTML, "Yui Hatano") == "yui-hatano"
     assert bot._parse_javdatabase_actor_slug(JAVDATABASE_SEARCH_HTML, "Other") == "yui-hatano"
@@ -914,25 +925,23 @@ def test_av_actor_route_handles_cjk_name(monkeypatch):
     assert seen == [("/av 三上悠亜", -100123, "三上悠亜")]
 
 
-def test_av_actor_lookup_pipeline_uses_three_sources(monkeypatch):
-    """javdb 查演员页 → r18.dev 桥接英文名 → javdatabase 收藏排序。"""
-    calls = {"javdb": [], "r18": [], "jd": []}
+def test_av_actor_lookup_pipeline_uses_javdb_social_hint(monkeypatch):
+    """CJK 名先走 JavDB，并用演员页社交账号桥接 javdatabase。"""
+    calls = {"javdb": [], "jd": []}
 
     async def fake_lookup_javdb_actor(name):
         calls["javdb"].append(name)
         return "/actors/Av2e", "三上悠亜"
 
-    async def fake_lookup_javdb_actor_codes(path, limit):
+    async def fake_lookup_javdb_actor_profile(path, limit):
         calls["javdb"].append(path)
-        return ["OFJE-712", "OFJE-659"]
-
-    async def fake_lookup_r18dev(dvd_id):
-        calls["r18"].append(dvd_id)
-        return "", "https://pics.dmm.co.jp/digital/video/demo/demopl.jpg", ["Yua Mikami"]
+        return ["OFJE-712", "OFJE-659"], ["yua mikami"]
 
     async def fake_lookup_javdatabase_actor_slug(romaji):
         calls["jd"].append(romaji)
-        assert romaji == "Yua Mikami"
+        if romaji == "三上悠亜":
+            raise bot.ActorNotFoundError("no direct CJK match")
+        assert romaji == "yua mikami"
         return "yua-mikami"
 
     async def fake_lookup_javdatabase_top_movies(slug, limit):
@@ -943,8 +952,7 @@ def test_av_actor_lookup_pipeline_uses_three_sources(monkeypatch):
         ]
 
     monkeypatch.setattr(bot, "_lookup_javdb_actor", fake_lookup_javdb_actor)
-    monkeypatch.setattr(bot, "_lookup_javdb_actor_codes", fake_lookup_javdb_actor_codes)
-    monkeypatch.setattr(bot, "_lookup_r18dev_cover", fake_lookup_r18dev)
+    monkeypatch.setattr(bot, "_lookup_javdb_actor_profile", fake_lookup_javdb_actor_profile)
     monkeypatch.setattr(bot, "_lookup_javdatabase_actor_slug", fake_lookup_javdatabase_actor_slug)
     monkeypatch.setattr(bot, "_lookup_javdatabase_top_movies", fake_lookup_javdatabase_top_movies)
 
@@ -954,6 +962,29 @@ def test_av_actor_lookup_pipeline_uses_three_sources(monkeypatch):
     assert movies[0]["actor_romaji"] == "Yua Mikami"
     assert calls == {
         "javdb": ["三上悠亜", "/actors/Av2e"],
-        "r18": ["OFJE-712", "OFJE-659"],
-        "jd": ["Yua Mikami", "yua-mikami"],
+        "jd": ["三上悠亜", "yua mikami", "yua-mikami"],
     }
+
+
+def test_av_actor_lookup_pipeline_accepts_english_name_without_javdb(monkeypatch):
+    calls = []
+
+    async def fail_javdb(_name):
+        raise AssertionError("English names must not depend on JavDB actor search")
+
+    async def fake_slug(name):
+        calls.append(name)
+        return "tsukasa-aoi"
+
+    async def fake_movies(slug, limit):
+        calls.append(slug)
+        return [{"code": "SSNI-001", "title": "Demo", "date": "", "cover": ""}]
+
+    monkeypatch.setattr(bot, "_lookup_javdb_actor", fail_javdb)
+    monkeypatch.setattr(bot, "_lookup_javdatabase_actor_slug", fake_slug)
+    monkeypatch.setattr(bot, "_lookup_javdatabase_top_movies", fake_movies)
+
+    movies = asyncio.run(bot._lookup_actor_top_videos("Tsukasa Aoi"))
+    assert movies[0]["actor_display"] == "Tsukasa Aoi"
+    assert movies[0]["actor_romaji"] == "Tsukasa Aoi"
+    assert calls == ["Tsukasa Aoi", "tsukasa-aoi"]

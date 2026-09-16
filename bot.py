@@ -184,7 +184,8 @@ R18DEV_USER_AGENT = (
     "group-ai-bot/1.0 "
     "(single cover lookup; https://github.com/Likhixang/group-ai-bot)"
 )
-# 演员名 → 热门番号查询：javdb 搜索 + r18.dev 名字桥接 + javdatabase 收藏排序。
+# 演员名 → 热门番号查询：英文名直查 javdatabase；CJK 名通过 JavDB 演员页
+# 的公开社交账号桥接罗马字名，再由 javdatabase 按收藏排序。
 # javdatabase.com 的 idol 页支持 `?_sort_=most_favorited`（收藏数倒序=最热门），
 # 匿名可访问且无 CF 防护；javdb 只用来把中文/日文名转成英文名（r18.dev 无名字搜索）。
 JAVDB_SEARCH_URL = "https://javdb.com/search?q={query}&f=actor"
@@ -196,7 +197,7 @@ JAVDATABASE_ACTOR_URL = "https://www.javdatabase.com/idols/{slug}/?_sort_=most_f
 JAVDATABASE_TIMEOUT = max(5, int(os.getenv("JAVDATABASE_TIMEOUT", "30")))
 JAVDATABASE_MAX_HTML_BYTES = 6 * 1024 * 1024
 JAVDATABASE_USER_AGENT = FOURHOI_USER_AGENT
-# /av 演员名：先用 javdb actor 页前 N 部番号经 r18.dev 统计出英文名，再查 javdatabase。
+# R18.dev 只作为极少数演员页没有可用罗马字提示时的最后兜底。
 AV_ACTOR_ROMJI_SAMPLE = 20
 AV_ACTOR_TOP_LIMIT = max(1, min(10, int(os.getenv("AV_ACTOR_TOP_LIMIT", "10"))))
 
@@ -3535,6 +3536,30 @@ def _parse_javdb_actor_codes(html: str, limit: int) -> list[str]:
     return seen
 
 
+def _parse_javdb_actor_romaji_hints(html: str) -> list[str]:
+    """Extract likely romanized names from public social handles on an actor page."""
+    if not html:
+        return []
+    handles = re.findall(
+        r'href="https?://(?:www\.)?(?:twitter\.com|x\.com|instagram\.com)/([^"/?#]+)',
+        html,
+        flags=re.I,
+    )
+    hints: list[str] = []
+    for handle in handles:
+        hint = urllib.parse.unquote(handle).strip("_.-")
+        hint = re.sub(r"[_.-]+", " ", hint)
+        hint = re.sub(r"\s+", " ", hint).strip().lower()
+        if (
+            3 <= len(hint) <= 80
+            and re.fullmatch(r"[a-z0-9 ]+", hint)
+            and any(ch.isalpha() for ch in hint)
+            and hint not in hints
+        ):
+            hints.append(hint)
+    return hints
+
+
 async def _lookup_javdb_actor(query: str) -> tuple[str, str]:
     """Search JavDB for an actress; return ``(actor_path, display_name)``."""
     headers = {
@@ -3587,6 +3612,35 @@ async def _lookup_javdb_actor_codes(actor_path: str, limit: int) -> list[str]:
     if not codes:
         raise ActorNotFoundError("JavDB 演员页没有可用的作品")
     return codes
+
+
+async def _lookup_javdb_actor_profile(
+    actor_path: str, limit: int
+) -> tuple[list[str], list[str]]:
+    """Fetch one JavDB actor page and return DVD IDs plus romanized-name hints."""
+    headers = {
+        "User-Agent": JAVDB_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    }
+    url = "https://javdb.com" + actor_path
+    timeout = httpx.Timeout(JAVDB_TIMEOUT, connect=8.0)
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=False, trust_env=False
+        ) as client:
+            response = await client.get(url, headers=headers)
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise ActorSearchError("JavDB 暂时无法访问") from exc
+    if response.status_code >= 400:
+        raise ActorSearchError(f"JavDB HTTP {response.status_code}")
+    if len(response.content) > JAVDB_MAX_HTML_BYTES:
+        raise ActorSearchError("JavDB 响应过大")
+    codes = _parse_javdb_actor_codes(response.text, limit)
+    hints = _parse_javdb_actor_romaji_hints(response.text)
+    if not codes and not hints:
+        raise ActorNotFoundError("JavDB 演员页没有可用信息")
+    return codes, hints
 
 
 async def _resolve_actor_romaji(codes: list[str]) -> str:
@@ -3672,7 +3726,9 @@ def _parse_javdatabase_top_movies(html: str, limit: int) -> list[dict]:
         code = code_match.group(1).strip()
         cover_match = re.search(r'<img src="([^"]+)"', card)
         # 标题在 mt-auto 区块的 cut-text 里；pcard 里的第一个 cut-text 是番号本身。
-        meta_match = re.search(r'<div class="mt-auto">(.*?)</div>\s*</div>', card, flags=re.S)
+        meta_match = re.search(
+            r'<div class="mt-auto"[^>]*>(.*?)</div>\s*</div>', card, flags=re.S
+        )
         title_match = (
             re.search(r'class="cut-text">([^<]{1,300})</a>', meta_match.group(1), flags=re.S)
             if meta_match
@@ -3717,16 +3773,36 @@ async def _lookup_javdatabase_top_movies(slug: str, limit: int) -> list[dict]:
 
 
 async def _lookup_actor_top_videos(name: str) -> list[dict]:
-    """Full pipeline: actress name → top N movies sorted by favorites.
+    """Resolve an actress name and return javdatabase's most-favorited movies.
 
-    JavDB translates a CJK name to its canonical page; R18.dev turns sample
-    DVD IDs into the English romaji name; javdatabase.com then provides the
-    most-favorited ranking. The user-facing errors are already safe.
+    English names go directly to javdatabase. CJK names first try the same
+    source, then use JavDB's actor page and its public social handles as a
+    deterministic romanized-name bridge. R18.dev sampling is only a fallback
+    when no social hint resolves; this avoids ensemble titles outvoting the
+    requested actress.
     """
-    actor_path, display_name = await _lookup_javdb_actor(name)
-    codes = await _lookup_javdb_actor_codes(actor_path, AV_ACTOR_ROMJI_SAMPLE)
-    romaji = await _resolve_actor_romaji(codes)
-    slug = await _lookup_javdatabase_actor_slug(romaji)
+    display_name = name
+    romaji = name
+    try:
+        slug = await _lookup_javdatabase_actor_slug(name)
+    except ActorNotFoundError:
+        if not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", name):
+            raise
+        actor_path, display_name = await _lookup_javdb_actor(name)
+        codes, hints = await _lookup_javdb_actor_profile(
+            actor_path, AV_ACTOR_ROMJI_SAMPLE
+        )
+        slug = ""
+        for hint in hints:
+            try:
+                slug = await _lookup_javdatabase_actor_slug(hint)
+                romaji = " ".join(part.capitalize() for part in hint.split())
+                break
+            except ActorNotFoundError:
+                continue
+        if not slug:
+            romaji = await _resolve_actor_romaji(codes)
+            slug = await _lookup_javdatabase_actor_slug(romaji)
     movies = await _lookup_javdatabase_top_movies(slug, AV_ACTOR_TOP_LIMIT)
     if not movies:
         raise ActorSearchError("javdatabase 没有返回可用的作品")
