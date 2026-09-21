@@ -79,10 +79,9 @@ def test_message_contains_link_caption_raw_url():
 
 
 @pytest.mark.asyncio
-async def test_enforce_link_rule_replies_without_deleting():
+async def test_enforce_link_rule_replies_with_fixed_warning():
     update = MagicMock()
     context = MagicMock()
-    context.bot.delete_message = AsyncMock()
 
     chat = MagicMock()
     chat.type = ChatType.SUPERGROUP
@@ -99,66 +98,18 @@ async def test_enforce_link_rule_replies_without_deleting():
     msg.caption = None
     msg.entities = ()
     msg.caption_entities = ()
-
-    status_msg = MagicMock()
-    status_msg.edit_text = AsyncMock()
-    msg.reply_text = AsyncMock(return_value=status_msg)
+    msg.reply_text = AsyncMock()
     update.effective_message = msg
 
     orig_allowed = bot._is_allowed_chat
     orig_protected = bot._is_soft_ban_protected_user
-    orig_review = bot._review_link_content_with_luna
     try:
         bot._is_allowed_chat = lambda c: True
         bot._is_soft_ban_protected_user = lambda uid: False
-        bot._review_link_content_with_luna = AsyncMock(return_value="这篇文章其实就是老生常谈的吹水水文，没什么营养。\n含屎量：75%")
 
         await bot.enforce_link_rule(update, context)
 
-        context.bot.delete_message.assert_not_called()
-        msg.reply_text.assert_awaited_once_with("🔍 Luna 正在审评该链接内容...")
-        status_msg.edit_text.assert_awaited_once_with(
-            "这篇文章其实就是老生常谈的吹水水文，没什么营养。\n\n<blockquote>💩 含屎量：75%</blockquote>",
-            parse_mode=bot.ParseMode.HTML,
-        )
+        msg.reply_text.assert_awaited_once_with("链接未经验证，谨慎参考")
     finally:
         bot._is_allowed_chat = orig_allowed
         bot._is_soft_ban_protected_user = orig_protected
-        bot._review_link_content_with_luna = orig_review
-
-
-@pytest.mark.asyncio
-async def test_extract_first_link_from_message():
-    # URL entity
-    msg = MagicMock()
-    msg.text = "check https://example.com/a here"
-    msg.caption = None
-    ent = MessageEntity(type=MessageEntityType.URL, offset=6, length=21)
-    msg.entities = (ent,)
-    msg.caption_entities = ()
-    assert bot._extract_first_link_from_message(msg) == "https://example.com/a"
-
-    # TEXT_LINK entity
-    msg_tl = MagicMock()
-    msg_tl.text = "click here"
-    msg_tl.caption = None
-    ent_tl = MessageEntity(type=MessageEntityType.TEXT_LINK, offset=0, length=10, url="https://example.com/custom")
-    msg_tl.entities = (ent_tl,)
-    msg_tl.caption_entities = ()
-    assert bot._extract_first_link_from_message(msg_tl) == "https://example.com/custom"
-
-
-@pytest.mark.asyncio
-async def test_luna_link_review_uses_minimal_prompt_and_luna_model(monkeypatch):
-    monkeypatch.setattr(bot, "_fetch_url_readable", AsyncMock(return_value="网站正文"))
-    ask = AsyncMock(return_value="锐评\n含屎量：42%")
-    monkeypatch.setattr(bot, "_ask_ai_once", ask)
-
-    result = await bot._review_link_content_with_luna("https://example.com")
-
-    assert result == "锐评\n含屎量：42%"
-    ask.assert_awaited_once_with(
-        [{"role": "user", "content": "锐评网站内容，评价含屎量：\n网站正文"}],
-        model_name=bot.LUNA_MODEL,
-        temperature=0.7,
-    )

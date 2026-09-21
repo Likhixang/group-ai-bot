@@ -5798,98 +5798,8 @@ def _message_contains_link(msg: Message) -> bool:
     return False
 
 
-def _extract_first_link_from_message(msg: Message) -> Optional[str]:
-    """Extract first link URL from message entities or fallback text regex."""
-    if not msg:
-        return None
-
-    # Text entities
-    text = msg.text or ""
-    for ent in (msg.entities or ()):
-        if ent.type == MessageEntityType.TEXT_LINK and getattr(ent, "url", None):
-            return ent.url
-        if ent.type == MessageEntityType.URL:
-            extracted = text[ent.offset : ent.offset + ent.length]
-            if extracted:
-                return extracted
-
-    # Caption entities
-    caption = msg.caption or ""
-    for ent in (msg.caption_entities or ()):
-        if ent.type == MessageEntityType.TEXT_LINK and getattr(ent, "url", None):
-            return ent.url
-        if ent.type == MessageEntityType.URL:
-            extracted = caption[ent.offset : ent.offset + ent.length]
-            if extracted:
-                return extracted
-
-    # Regex fallback
-    full_text = text or caption
-    if full_text:
-        m = URL_PATTERN.search(full_text)
-        if m:
-            return m.group(0)
-
-    return None
-
-
-def _format_luna_link_review(raw_review: str) -> str:
-    """Format Luna review output with Telegram blockquote for the shit content line."""
-    text = (raw_review or "").strip()
-    if not text:
-        return "<blockquote>💩 含屎量：100%</blockquote>"
-
-    # Search for 含屎量 line
-    m = re.search(r"含屎量[：:]\s*(\d+(?:\.\d+)?%?)", text)
-    if m:
-        crap_val = m.group(1).strip()
-        if not crap_val.endswith("%"):
-            crap_val += "%"
-        shit_line = f"💩 含屎量：{crap_val}"
-    else:
-        # Fallback if Luna didn't strictly format it
-        shit_line = "💩 含屎量：未知（未能解析具体数值）"
-
-    # Remove any standalone gold / shit lines from the summary body
-    cleaned_lines = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        if re.search(r"^(?:[-*•]\s*)?含金量[：:]", stripped):
-            continue
-        if re.search(r"^(?:[-*•]\s*)?含屎量[：:]", stripped):
-            continue
-        cleaned_lines.append(line)
-
-    summary_body = "\n".join(cleaned_lines).strip()
-    safe_body = escape(summary_body)
-    safe_shit_line = escape(shit_line)
-
-    if safe_body:
-        return f"{safe_body}\n\n<blockquote>{safe_shit_line}</blockquote>"
-    return f"<blockquote>{safe_shit_line}</blockquote>"
-
-
-async def _review_link_content_with_luna(url: str) -> str:
-    """Fetch URL content and ask Luna for a sharp review plus shit-content score."""
-    content = ""
-    try:
-        content = await _fetch_url_readable(url)
-    except Exception as exc:
-        logger.warning("Failed to fetch link content for %s: %s", url, exc)
-
-    prompt_content = content[:WEB_FETCH_MAX_CHARS] if content else url
-    messages = [
-        {
-            "role": "user",
-            "content": f"锐评网站内容，评价含屎量：\n{prompt_content}",
-        }
-    ]
-
-    return await _ask_ai_once(messages, model_name=LUNA_MODEL, temperature=0.7)
-
-
 async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """全群链接检测：调用 Luna 锐评网站内容并输出含屎量（超管豁免）。"""
+    """群内消息包含链接时，仅回复固定的风险提示。"""
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
@@ -5902,59 +5812,21 @@ async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user = msg.from_user
     if not user or getattr(user, "is_bot", False):
         return
-    # 超管（含 bot 自身）豁免
     if _is_soft_ban_protected_user(user.id):
         return
-
     if not _message_contains_link(msg):
         return
 
-    url = _extract_first_link_from_message(msg) or _extract_first_url(msg.text or msg.caption or "")
-    if not url:
-        return
-
-    status_msg = None
     try:
-        status_msg = await msg.reply_text("🔍 Luna 正在审评该链接内容...")
+        await msg.reply_text("链接未经验证，谨慎参考")
     except Exception:
         logger.warning(
-            "link_rule: initial reply failed chat=%s user=%s msg=%s",
+            "link_rule: warning reply failed chat=%s user=%s msg=%s",
             chat.id,
             user.id,
             msg.message_id,
             exc_info=True,
         )
-
-    try:
-        raw_evaluation = await _review_link_content_with_luna(url)
-        formatted_eval = _format_luna_link_review(raw_evaluation)
-
-        if status_msg:
-            try:
-                await status_msg.edit_text(formatted_eval, parse_mode=ParseMode.HTML)
-            except Exception:
-                await status_msg.edit_text(raw_evaluation.strip())
-        else:
-            try:
-                await msg.reply_text(formatted_eval, parse_mode=ParseMode.HTML)
-            except Exception:
-                await msg.reply_text(raw_evaluation.strip())
-    except Exception:
-        logger.warning(
-            "link_rule: Luna review failed chat=%s user=%s msg=%s",
-            chat.id,
-            user.id,
-            msg.message_id,
-            exc_info=True,
-        )
-        fallback_text = "<blockquote>💩 含屎量未经核实，审慎品鉴</blockquote>"
-        try:
-            if status_msg:
-                await status_msg.edit_text(fallback_text, parse_mode=ParseMode.HTML)
-            else:
-                await msg.reply_text(fallback_text, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
 
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

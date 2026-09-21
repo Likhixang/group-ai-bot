@@ -21,18 +21,24 @@ API_URLS = {
 TIMEOUT = 10
 
 
+def _mapping(value):
+    """Return a mapping for API payloads; reject occasional string/list responses."""
+    return value if isinstance(value, dict) else {}
+
+
 def _fetch(url):
-    """GET 请求，返回 JSON 或 None"""
+    """GET 请求，返回 JSON object 或错误对象。"""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "ipcheck-bot/1.0"})
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            return json.loads(resp.read().decode())
+            payload = json.loads(resp.read().decode())
+            return payload if isinstance(payload, dict) else {"_error": "unexpected JSON response"}
     except Exception as e:
         return {"_error": str(e)}
 
 
 def _fetch_post(url, data):
-    """POST JSON，返回 JSON 或 None"""
+    """POST JSON，返回 JSON object 或错误对象。"""
     try:
         body = json.dumps(data).encode()
         req = urllib.request.Request(
@@ -40,7 +46,8 @@ def _fetch_post(url, data):
             headers={"Content-Type": "application/json", "User-Agent": "ipcheck-bot/1.0"},
         )
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            return json.loads(resp.read().decode())
+            payload = json.loads(resp.read().decode())
+            return payload if isinstance(payload, dict) else {"_error": "unexpected JSON response"}
     except Exception as e:
         return {"_error": str(e)}
 
@@ -134,7 +141,7 @@ def check_ip(ip: str) -> dict:
     }
 
     # ---- ipapi.is ----
-    data1 = _fetch(API_URLS["ipapi"].format(ip=ip))
+    data1 = _mapping(_fetch(API_URLS["ipapi"].format(ip=ip)))
     result["sources"]["ipapi.is"] = data1
 
     if data1 and "_error" not in data1:
@@ -147,7 +154,7 @@ def check_ip(ip: str) -> dict:
         result["is_mobile"] = data1.get("is_mobile", False)
 
         # Location
-        loc = data1.get("location", {})
+        loc = _mapping(data1.get("location"))
         if loc:
             result["location"] = {
                 "country": loc.get("country", ""),
@@ -157,20 +164,20 @@ def check_ip(ip: str) -> dict:
             }
 
         # ASN / ISP
-        asn = data1.get("asn", {})
+        asn = _mapping(data1.get("asn"))
         if asn:
             result.setdefault("asn_sources", {})["ipapi.is"] = {
                 "num": asn.get("asn"),
                 "raw": f"AS{asn.get('asn', '?')} {asn.get('descr', '')}",
             }
 
-        company = data1.get("company", {})
+        company = _mapping(data1.get("company"))
         if company:
             result["org"] = company.get("name", "")
             result["isp"] = company.get("name", "")
 
         # VPN details
-        vpn = data1.get("vpn")
+        vpn = _mapping(data1.get("vpn"))
         if vpn:
             result["vpn_details"] = {
                 "service": vpn.get("service", ""),
@@ -179,7 +186,7 @@ def check_ip(ip: str) -> dict:
             }
 
         # Abuse contact
-        abuse = data1.get("abuse", {})
+        abuse = _mapping(data1.get("abuse"))
         if abuse:
             result["abuse_contact"] = abuse.get("email", "")
 
@@ -202,7 +209,7 @@ def check_ip(ip: str) -> dict:
         result["tags"] = tags
 
     # ---- ip-api.com ----
-    data2 = _fetch(API_URLS["ipapi_com"].format(ip=ip))
+    data2 = _mapping(_fetch(API_URLS["ipapi_com"].format(ip=ip)))
     result["sources"]["ip-api.com"] = data2
 
     if data2 and "_error" not in data2 and data2.get("status") == "success":
@@ -231,11 +238,11 @@ def check_ip(ip: str) -> dict:
             result["is_datacenter"] = True
 
     # ---- IPLogs ----
-    data3 = _fetch_post(API_URLS["iplogs"], {"ip": ip})
+    data3 = _mapping(_fetch_post(API_URLS["iplogs"], {"ip": ip}))
     result["sources"]["iplogs.com"] = data3
 
     if data3 and "_error" not in data3:
-        info = data3.get("ip_info") or {}
+        info = _mapping(data3.get("ip_info"))
         verdict = data3.get("verdict", "")
 
         # Type from IPLogs
@@ -269,7 +276,7 @@ def check_ip(ip: str) -> dict:
         }
 
     # ---- ipinfo.io（地理定位参考） ----
-    data4 = _fetch(API_URLS["ipinfo"].format(ip=ip))
+    data4 = _mapping(_fetch(API_URLS["ipinfo"].format(ip=ip)))
     result["sources"]["ipinfo.io"] = data4
 
     if data4 and "_error" not in data4:
@@ -299,9 +306,14 @@ def check_ip(ip: str) -> dict:
         pdb_req = urllib.request.Request(pdb_url, headers={"User-Agent": "ipcheck-bot/1.0", "Accept": "application/json"})
         with urllib.request.urlopen(pdb_req, timeout=8) as resp:
             pdb_data = json.loads(resp.read().decode())
+        pdb_data = _mapping(pdb_data)
         pdb_records = pdb_data.get("data", [])
+        if not isinstance(pdb_records, list):
+            pdb_records = []
         if pdb_records:
-            rec = pdb_records[0]
+            rec = _mapping(pdb_records[0])
+            if not rec:
+                raise ValueError("unexpected PeeringDB record")
             result["peeringdb"] = {
                 "asn": rec.get("asn"),
                 "name": rec.get("name", ""),
@@ -342,7 +354,7 @@ def check_ip(ip: str) -> dict:
         pass
 
     # ---- ip2location.io（位置/ASN/代理检测） ----
-    data5 = _fetch(API_URLS["ip2location"].format(ip=ip))
+    data5 = _mapping(_fetch(API_URLS["ip2location"].format(ip=ip)))
     result["sources"]["ip2location.io"] = data5
 
     if data5 and "_error" not in data5:
@@ -602,7 +614,7 @@ def format_report(result: dict) -> str:
                 yes_srcs.append("ip-api")
 
         if iplogs_ok:
-            info = d3.get("ip_info") or {}
+            info = _mapping(d3.get("ip_info"))
             verdict = d3.get("verdict", "")
             if name == "数据中心" and info.get("type") == "datacenter":
                 yes_srcs.append("iplogs")
