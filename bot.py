@@ -5814,6 +5814,10 @@ async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     if _is_soft_ban_protected_user(user.id):
         return
+    # Bot commands are handled by CommandHandler; never treat their arguments
+    # (for example `/ip 8.8.8.8`) as link messages.
+    if (msg.text or "").lstrip().startswith("/"):
+        return
     if not _message_contains_link(msg):
         return
 

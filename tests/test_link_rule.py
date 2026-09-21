@@ -113,3 +113,35 @@ async def test_enforce_link_rule_replies_with_fixed_warning():
     finally:
         bot._is_allowed_chat = orig_allowed
         bot._is_soft_ban_protected_user = orig_protected
+
+
+@pytest.mark.asyncio
+async def test_enforce_link_rule_ignores_ip_command():
+    update = MagicMock()
+    context = MagicMock()
+    chat = MagicMock(type=ChatType.SUPERGROUP, id=-100123456789)
+    user = MagicMock(id=999999, is_bot=False)
+    msg = MagicMock(
+        message_id=43,
+        from_user=user,
+        text="/ip 8.8.8.8",
+        caption=None,
+        entities=(),
+        caption_entities=(),
+    )
+    msg.reply_text = AsyncMock()
+    update.effective_chat = chat
+    update.effective_message = msg
+
+    orig_allowed = bot._is_allowed_chat
+    orig_protected = bot._is_soft_ban_protected_user
+    try:
+        bot._is_allowed_chat = lambda c: True
+        bot._is_soft_ban_protected_user = lambda uid: False
+
+        await bot.enforce_link_rule(update, context)
+
+        msg.reply_text.assert_not_awaited()
+    finally:
+        bot._is_allowed_chat = orig_allowed
+        bot._is_soft_ban_protected_user = orig_protected
