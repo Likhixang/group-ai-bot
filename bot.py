@@ -595,7 +595,39 @@ async def _check_due_codex_reset_alerts(application: Application) -> None:
         await _expire_codex_reset_alert(application, alert)
 
 
+async def _translate_codex_reset_text(text: str) -> str:
+    original = (text or "").strip()
+    if not original:
+        return ""
+    try:
+        translated = await _ask_ai_once(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是专业技术信息翻译器。将用户提供的英文公告翻译成自然、准确的简体中文。"
+                        "只输出译文，不要解释、摘要、前缀或引号。保留 URL、数字、产品名、模型名、"
+                        "API 和专有名词；不要翻译 URL。"
+                    ),
+                },
+                {"role": "user", "content": original},
+            ],
+            LUNA_MODEL,
+            temperature=0.1,
+        )
+        translated = (translated or "").strip()
+        if translated:
+            return translated[:CODEX_RESET_MAX_DESCRIPTION]
+    except Exception as exc:
+        logger.warning("Codex reset translation failed; using original text: %s", exc)
+    return original[:CODEX_RESET_MAX_DESCRIPTION]
+
+
 async def _publish_codex_reset_alert(application: Application, item: dict) -> int:
+    translated_item = dict(item)
+    translated_item["description"] = await _translate_codex_reset_text(
+        item.get("description") or ""
+    )
     current = _load_managed_pin(PIN_TARGET_CHAT_ID, PIN_TARGET_TOPIC_ID)
     if current and current.get("message_id"):
         try:
@@ -611,7 +643,7 @@ async def _publish_codex_reset_alert(application: Application, item: dict) -> in
             )
     send_kwargs = {
         "chat_id": PIN_TARGET_CHAT_ID,
-        "text": _format_codex_reset_alert(item),
+        "text": _format_codex_reset_alert(translated_item),
         "parse_mode": ParseMode.HTML,
         "disable_web_page_preview": True,
     }

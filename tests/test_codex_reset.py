@@ -111,3 +111,33 @@ def test_reset_command_uses_api_schedule_and_twitter_link(reset_db):
     assert "上次重置：2026-09-12 16:09" in text
     assert "下次预计重置：2026-09-23 15:00" in text
     assert "https://x.com/thsottiaux/status/2222222222" in text
+
+
+@pytest.mark.asyncio
+async def test_codex_reset_translation_uses_luna(monkeypatch):
+    calls = {}
+
+    async def fake_ask(messages, model_name, temperature=0.2):
+        calls["model"] = model_name
+        calls["temperature"] = temperature
+        calls["messages"] = messages
+        return "GPT-6 Sol 和 Luna 已发布。"
+
+    monkeypatch.setattr(bot, "_ask_ai_once", fake_ask)
+    translated = await bot._translate_codex_reset_text(
+        "GPT-6 Sol and Luna are out. https://t.co/example"
+    )
+    assert translated == "GPT-6 Sol 和 Luna 已发布。"
+    assert calls["model"] == "gpt-5.6-luna"
+    assert calls["temperature"] == 0.1
+    assert calls["messages"][1]["content"].endswith("https://t.co/example")
+
+
+@pytest.mark.asyncio
+async def test_codex_reset_translation_falls_back_to_original(monkeypatch):
+    async def failing_ask(*args, **kwargs):
+        raise RuntimeError("translation unavailable")
+
+    monkeypatch.setattr(bot, "_ask_ai_once", failing_ask)
+    original = "Reset all propagated. https://x.com/example/status/123"
+    assert await bot._translate_codex_reset_text(original) == original
