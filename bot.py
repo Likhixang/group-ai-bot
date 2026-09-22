@@ -8,6 +8,8 @@ import sqlite3
 import re
 import urllib.parse
 import base64
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from collections import defaultdict
 from html import escape, unescape
@@ -100,6 +102,21 @@ DEFAULT_DAILY_PIN_TEXT = os.getenv(
     "DEFAULT_DAILY_PIN_TEXT",
     "这里不许开盒 涉政 灰产 要饭 可以搞黄色",
 ).strip()
+
+# --- Codex reset RSS alert ---
+CODEX_RESET_ENABLED = os.getenv("CODEX_RESET_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+CODEX_RESET_FEED_URL = os.getenv(
+    "CODEX_RESET_FEED_URL",
+    "https://codexreset.vercel.app/api/feed/codex",
+).strip()
+CODEX_RESET_POLL_INTERVAL = max(30, int(os.getenv("CODEX_RESET_POLL_INTERVAL", "120")))
+CODEX_RESET_PIN_SECONDS = max(60, int(os.getenv("CODEX_RESET_PIN_SECONDS", "1800")))
+CODEX_RESET_MAX_DESCRIPTION = max(
+    200, int(os.getenv("CODEX_RESET_MAX_DESCRIPTION", "1200"))
+)
+CODEX_RESET_USER_AGENT = "Anyincubation_bot/codex-reset-rss/1.0"
 
 BOT_USERNAME: Optional[str] = None
 BOT_ID: Optional[int] = None
@@ -526,6 +543,148 @@ async def _publish_managed_pin(
         return sent.message_id
 
 
+async def _fetch_codex_reset_feed() -> list[dict]:
+    cache_buster = int(time.time())
+    separator = "&" if "?" in CODEX_RESET_FEED_URL else "?"
+    url = f"{CODEX_RESET_FEED_URL}{separator}_={cache_buster}"
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True, trust_env=False
+    ) as client:
+        response = await client.get(
+            url,
+            headers={
+                "Accept": "application/rss+xml, application/xml",
+                "User-Agent": CODEX_RESET_USER_AGENT,
+            },
+        )
+        response.raise_for_status()
+    if len(response.content) > 2 * 1024 * 1024:
+        raise ValueError("Codex reset RSS response is too large")
+    return _parse_codex_reset_feed(response.content)
+
+
+async def _expire_codex_reset_alert(application: Application, alert: dict) -> None:
+    message_id = int(alert["message_id"])
+    try:
+        await application.bot.unpin_chat_message(
+            chat_id=PIN_TARGET_CHAT_ID, message_id=message_id
+        )
+    except Exception:
+        logger.info(
+            "Codex reset alert unpin skipped: chat=%s message_id=%s",
+            PIN_TARGET_CHAT_ID,
+            message_id,
+            exc_info=True,
+        )
+
+    current = _load_managed_pin(PIN_TARGET_CHAT_ID, PIN_TARGET_TOPIC_ID)
+    previous_id = alert.get("previous_message_id")
+    if previous_id is not None:
+        should_restore = bool(
+            current
+            and not current.get("disabled")
+            and current.get("message_id") == previous_id
+        )
+    else:
+        should_restore = current is None or bool(current.get("disabled"))
+
+    _mark_codex_reset_alert_expired(alert["guid"])
+    if not should_restore or alert.get("previous_disabled") or not alert.get("previous_pin_text"):
+        return
+
+    try:
+        await _publish_managed_pin(
+            application.bot,
+            chat_id=PIN_TARGET_CHAT_ID,
+            topic_id=PIN_TARGET_TOPIC_ID,
+            text=alert["previous_pin_text"],
+            entities=_deserialize_entities(alert.get("previous_pin_entities")),
+        )
+        logger.info("Restored managed pin after Codex reset alert: guid=%s", alert["guid"])
+    except Exception:
+        logger.warning(
+            "Failed to restore managed pin after Codex reset alert: guid=%s",
+            alert["guid"],
+            exc_info=True,
+        )
+
+
+async def _check_due_codex_reset_alerts(application: Application) -> None:
+    for alert in _load_due_codex_reset_alerts():
+        await _expire_codex_reset_alert(application, alert)
+
+
+async def _publish_codex_reset_alert(application: Application, item: dict) -> int:
+    current = _load_managed_pin(PIN_TARGET_CHAT_ID, PIN_TARGET_TOPIC_ID)
+    if current and current.get("message_id"):
+        try:
+            await application.bot.unpin_chat_message(
+                chat_id=PIN_TARGET_CHAT_ID,
+                message_id=current["message_id"],
+            )
+        except Exception:
+            logger.info(
+                "Codex reset alert could not unpin managed pin before override: message_id=%s",
+                current["message_id"],
+                exc_info=True,
+            )
+    send_kwargs = {
+        "chat_id": PIN_TARGET_CHAT_ID,
+        "text": _format_codex_reset_alert(item),
+        "parse_mode": ParseMode.HTML,
+        "disable_web_page_preview": True,
+    }
+    if int(PIN_TARGET_TOPIC_ID) > 0:
+        send_kwargs["message_thread_id"] = int(PIN_TARGET_TOPIC_ID)
+    sent = await application.bot.send_message(**send_kwargs)
+    try:
+        await application.bot.pin_chat_message(
+            chat_id=PIN_TARGET_CHAT_ID,
+            message_id=sent.message_id,
+            disable_notification=True,
+        )
+    except Exception:
+        try:
+            await application.bot.delete_message(
+                chat_id=PIN_TARGET_CHAT_ID, message_id=sent.message_id
+            )
+        except Exception:
+            pass
+        raise
+
+    expires_at = int(time.time()) + CODEX_RESET_PIN_SECONDS
+    _save_codex_reset_alert(item["guid"], sent.message_id, expires_at, current)
+    _mark_codex_reset_notified(item["guid"], sent.message_id)
+    logger.info(
+        "Codex reset alert published: guid=%s message_id=%s expires_at=%s",
+        item["guid"], sent.message_id, expires_at,
+    )
+    return int(sent.message_id)
+
+
+async def _codex_reset_scheduler_loop(application: Application) -> None:
+    if not CODEX_RESET_ENABLED or not CODEX_RESET_FEED_URL:
+        logger.info("Codex reset RSS alert disabled")
+        return
+    if not PIN_TARGET_CHAT_ID or not PIN_TARGET_TOPIC_ID:
+        logger.warning("Codex reset RSS alert disabled: pin target is not configured")
+        return
+
+    while True:
+        try:
+            await _check_due_codex_reset_alerts(application)
+            items = await _fetch_codex_reset_feed()
+            candidates = _prepare_codex_reset_candidates(items, int(time.time()))
+            if candidates and not _has_active_codex_reset_alert():
+                async with PIN_LOCK:
+                    if not _has_active_codex_reset_alert():
+                        await _publish_codex_reset_alert(application, candidates[0])
+        except Exception:
+            logger.exception("Codex reset RSS scheduler failed")
+        await asyncio.sleep(CODEX_RESET_POLL_INTERVAL)
+
+
 async def _managed_pin_scheduler_loop(application: Application) -> None:
     global PIN_LAST_RUN_DATE
     if not PIN_TARGET_CHAT_ID or not PIN_TARGET_TOPIC_ID:
@@ -537,6 +696,10 @@ async def _managed_pin_scheduler_loop(application: Application) -> None:
             run_date = now.strftime("%Y-%m-%d")
             should_run = now.hour == PIN_HOUR and now.minute == PIN_MINUTE
             if should_run and PIN_LAST_RUN_DATE != run_date:
+                if _has_active_codex_reset_alert():
+                    PIN_LAST_RUN_DATE = run_date
+                    await asyncio.sleep(20)
+                    continue
                 current = _load_managed_pin(PIN_TARGET_CHAT_ID, PIN_TARGET_TOPIC_ID)
                 if current and current.get("disabled"):
                     logger.info("Managed pin is disabled, skipping daily auto-pin")
@@ -1661,7 +1824,36 @@ def _init_memory_db() -> None:
             ON managed_pins(updated_at)
             """
         )
-        # Add disabled column for existing DBs (safe to re-run)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS codex_reset_state (
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS codex_reset_items (
+                guid TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                link TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                pub_date TEXT NOT NULL DEFAULT '',
+                seen_at INTEGER NOT NULL,
+                notified_at INTEGER NOT NULL DEFAULT 0,
+                alert_message_id INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS codex_reset_alerts (
+                guid TEXT PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                previous_message_id INTEGER,
+                previous_pin_text TEXT NOT NULL DEFAULT '',
+                previous_pin_entities TEXT,
+                previous_disabled INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1
+            )"""
+        )
         try:
             conn.execute(
                 "ALTER TABLE managed_pins ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0"
@@ -1979,6 +2171,229 @@ def _load_managed_pin_text(chat_id: int, topic_id: str) -> str:
     if row and row["pin_text"].strip():
         return row["pin_text"].strip()
     return DEFAULT_DAILY_PIN_TEXT
+
+
+def _codex_reset_is_confirmed(item: dict) -> bool:
+    return (item.get("title") or "").strip().upper().startswith("[RESET CONFIRMED]")
+
+
+def _parse_codex_reset_feed(xml_bytes: bytes) -> list[dict]:
+    """Parse the external RSS feed into bounded dictionaries."""
+    root = ET.fromstring(xml_bytes)
+    channel = root.find("channel")
+    if channel is None:
+        return []
+    items = []
+    for element in channel.findall("item"):
+        guid = (element.findtext("guid") or "").strip()
+        if not guid:
+            continue
+        items.append(
+            {
+                "guid": guid[:256],
+                "title": (element.findtext("title") or "").strip()[:300],
+                "link": (element.findtext("link") or "").strip()[:1000],
+                "description": (element.findtext("description") or "").strip()[:12000],
+                "pub_date": (element.findtext("pubDate") or "").strip()[:128],
+            }
+        )
+    return items
+
+
+def _codex_reset_sort_key(item: dict) -> tuple:
+    raw = item.get("pub_date") or ""
+    try:
+        value = parsedate_to_datetime(raw).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    return (value, item.get("guid") or "")
+
+
+def _load_codex_state(key: str) -> Optional[str]:
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT state_value FROM codex_reset_state WHERE state_key=?", (key,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return str(row[0]) if row else None
+
+
+def _prepare_codex_reset_candidates(items: list[dict], now: int) -> list[dict]:
+    """Persist feed state and return only newly confirmed reset items.
+
+    The first successful poll creates a baseline without notifying historical
+    items. An announcement that later changes to RESET CONFIRMED is eligible.
+    """
+    if not items:
+        return []
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    candidates: list[dict] = []
+    try:
+        initialized = _load_codex_state("feed_initialized") == "1"
+        for item in items:
+            guid = item["guid"]
+            row = conn.execute(
+                "SELECT notified_at FROM codex_reset_items WHERE guid=?", (guid,)
+            ).fetchone()
+            if row is None:
+                baseline_notified = now if not initialized and _codex_reset_is_confirmed(item) else 0
+                conn.execute(
+                    """INSERT INTO codex_reset_items(
+                           guid, title, link, description, pub_date, seen_at, notified_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        guid,
+                        item["title"],
+                        item["link"],
+                        item["description"],
+                        item["pub_date"],
+                        now,
+                        baseline_notified,
+                    ),
+                )
+                if initialized and _codex_reset_is_confirmed(item):
+                    candidates.append(item)
+                continue
+
+            notified_at = int(row[0] or 0)
+            conn.execute(
+                """UPDATE codex_reset_items
+                   SET title=?, link=?, description=?, pub_date=?, seen_at=?
+                   WHERE guid=?""",
+                (
+                    item["title"],
+                    item["link"],
+                    item["description"],
+                    item["pub_date"],
+                    now,
+                    guid,
+                ),
+            )
+            if initialized and _codex_reset_is_confirmed(item) and not notified_at:
+                candidates.append(item)
+
+        if not initialized:
+            conn.execute(
+                """INSERT INTO codex_reset_state(state_key, state_value)
+                   VALUES ('feed_initialized', '1')
+                   ON CONFLICT(state_key) DO UPDATE SET state_value='1'"""
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return sorted(candidates, key=_codex_reset_sort_key)
+
+
+def _mark_codex_reset_notified(guid: str, message_id: int, now: Optional[int] = None) -> None:
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        conn.execute(
+            """UPDATE codex_reset_items
+               SET notified_at=?, alert_message_id=?
+               WHERE guid=?""",
+            (int(now if now is not None else time.time()), int(message_id), guid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _save_codex_reset_alert(guid: str, message_id: int, expires_at: int, previous: Optional[dict]) -> None:
+    previous = previous or {}
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        conn.execute("UPDATE codex_reset_alerts SET active=0 WHERE active=1")
+        conn.execute(
+            """INSERT INTO codex_reset_alerts(
+                   guid, message_id, expires_at, previous_message_id,
+                   previous_pin_text, previous_pin_entities, previous_disabled, active
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+               ON CONFLICT(guid) DO UPDATE SET
+                   message_id=excluded.message_id,
+                   expires_at=excluded.expires_at,
+                   previous_message_id=excluded.previous_message_id,
+                   previous_pin_text=excluded.previous_pin_text,
+                   previous_pin_entities=excluded.previous_pin_entities,
+                   previous_disabled=excluded.previous_disabled,
+                   active=1""",
+            (
+                guid,
+                int(message_id),
+                int(expires_at),
+                previous.get("message_id"),
+                previous.get("pin_text") or "",
+                _serialize_entities(previous.get("entities")),
+                int(bool(previous.get("disabled"))),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _load_due_codex_reset_alerts(now: Optional[int] = None) -> list[dict]:
+    ts = int(now if now is not None else time.time())
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        rows = conn.execute(
+            """SELECT guid, message_id, expires_at, previous_message_id,
+                      previous_pin_text, previous_pin_entities, previous_disabled, active
+               FROM codex_reset_alerts
+               WHERE active=1 AND expires_at <= ?
+               ORDER BY expires_at ASC""",
+            (ts,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "guid": str(row[0]),
+            "message_id": int(row[1]),
+            "expires_at": int(row[2]),
+            "previous_message_id": int(row[3]) if row[3] is not None else None,
+            "previous_pin_text": str(row[4] or ""),
+            "previous_pin_entities": row[5],
+            "previous_disabled": bool(row[6]),
+            "active": bool(row[7]),
+        }
+        for row in rows
+    ]
+
+
+def _has_active_codex_reset_alert() -> bool:
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM codex_reset_alerts WHERE active=1 LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
+def _mark_codex_reset_alert_expired(guid: str) -> None:
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        conn.execute("UPDATE codex_reset_alerts SET active=0 WHERE guid=?", (guid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _format_codex_reset_alert(item: dict) -> str:
+    description = re.split(
+        r"\n\s*Classifier Rationale:\s*", item.get("description") or "", maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()[:CODEX_RESET_MAX_DESCRIPTION]
+    lines = ["🚨 <b>Codex 重置已确认</b>"]
+    if description:
+        lines.extend(["", escape(description)])
+    link = item.get("link") or ""
+    if re.match(r"^https?://", link, re.IGNORECASE):
+        lines.extend(["", f'🔗 <a href="{escape(link, quote=True)}">查看来源</a>'])
+    return "\n".join(lines)
 
 
 def _deserialize_entities(db_entities) -> Optional[list]:
@@ -7098,6 +7513,7 @@ async def post_init(application: Application) -> None:
         commands, scope=BotCommandScopeAllPrivateChats()
     )
     application.create_task(_managed_pin_scheduler_loop(application))
+    application.create_task(_codex_reset_scheduler_loop(application))
     application.create_task(_ban_release_scheduler_loop(application))
     if INACTIVITY_WARN_ENABLED:
         application.create_task(_inactivity_scheduler_loop(application))
