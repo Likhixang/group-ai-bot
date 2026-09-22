@@ -104,14 +104,10 @@ DEFAULT_DAILY_PIN_TEXT = os.getenv(
     "这里不许开盒 涉政 灰产 要饭 可以搞黄色",
 ).strip()
 
-# --- Codex reset RSS alert ---
+# --- Codex reset API alert ---
 CODEX_RESET_ENABLED = os.getenv("CODEX_RESET_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off", ""
 }
-CODEX_RESET_FEED_URL = os.getenv(
-    "CODEX_RESET_FEED_URL",
-    "https://codexreset.vercel.app/api/feed/codex",
-).strip()
 CODEX_RESET_POLL_INTERVAL = max(30, int(os.getenv("CODEX_RESET_POLL_INTERVAL", "120")))
 CODEX_RESET_PIN_SECONDS = max(60, int(os.getenv("CODEX_RESET_PIN_SECONDS", "1800")))
 CODEX_RESET_MAX_DESCRIPTION = max(
@@ -120,11 +116,8 @@ CODEX_RESET_MAX_DESCRIPTION = max(
 CODEX_RESET_API_URL = os.getenv(
     "CODEX_RESET_API_URL", "https://codex-resets.com/api/v1/status"
 ).strip()
-CODEX_RESET_EVENT_WINDOW_SECONDS = max(
-    300, int(os.getenv("CODEX_RESET_EVENT_WINDOW_SECONDS", str(6 * 3600)))
-)
 CODEX_RESET_API_ETAG_STATE_KEY = "api_status_etag"
-CODEX_RESET_USER_AGENT = "Anyincubation_bot/codex-reset-monitor/2.0"
+CODEX_RESET_USER_AGENT = "Anyincubation_bot/codex-reset-api/3.0"
 
 BOT_USERNAME: Optional[str] = None
 BOT_ID: Optional[int] = None
@@ -551,27 +544,6 @@ async def _publish_managed_pin(
         return sent.message_id
 
 
-async def _fetch_codex_reset_feed() -> list[dict]:
-    cache_buster = int(time.time())
-    separator = "&" if "?" in CODEX_RESET_FEED_URL else "?"
-    url = f"{CODEX_RESET_FEED_URL}{separator}_={cache_buster}"
-    timeout = httpx.Timeout(30.0, connect=10.0)
-    async with httpx.AsyncClient(
-        timeout=timeout, follow_redirects=True, trust_env=False
-    ) as client:
-        response = await client.get(
-            url,
-            headers={
-                "Accept": "application/rss+xml, application/xml",
-                "User-Agent": CODEX_RESET_USER_AGENT,
-            },
-        )
-        response.raise_for_status()
-    if len(response.content) > 2 * 1024 * 1024:
-        raise ValueError("Codex reset RSS response is too large")
-    return _parse_codex_reset_feed(response.content)
-
-
 async def _expire_codex_reset_alert(application: Application, alert: dict) -> None:
     message_id = int(alert["message_id"])
     try:
@@ -675,58 +647,35 @@ async def _publish_codex_reset_alert(application: Application, item: dict) -> in
 
 
 async def _codex_reset_scheduler_loop(application: Application) -> None:
-    if not CODEX_RESET_ENABLED or not CODEX_RESET_FEED_URL or not CODEX_RESET_API_URL:
-        logger.info("Codex reset monitor disabled")
+    if not CODEX_RESET_ENABLED or not CODEX_RESET_API_URL:
+        logger.info("Codex reset API monitor disabled")
         return
     if not PIN_TARGET_CHAT_ID or not PIN_TARGET_TOPIC_ID:
-        logger.warning("Codex reset monitor disabled: pin target is not configured")
+        logger.warning("Codex reset API monitor disabled: pin target is not configured")
         return
 
     while True:
         try:
             await _check_due_codex_reset_alerts(application)
             now = int(time.time())
-            feed_result, api_result = await asyncio.gather(
-                _fetch_codex_reset_feed(),
-                _fetch_codex_reset_api(),
-                return_exceptions=True,
-            )
-            candidates: list[dict] = []
-
-            if isinstance(feed_result, Exception):
-                logger.warning("Codex reset RSS fetch failed", exc_info=feed_result)
-            elif feed_result:
-                confirmed = [item for item in feed_result if _codex_reset_is_confirmed(item)]
-                baseline = _load_codex_state("unified_rss_initialized") != "1"
-                for item in confirmed:
-                    normalized = _rss_reset_to_item(item)
-                    if _record_codex_observation(normalized, now, baseline=baseline):
-                        candidates.append(normalized)
-                if baseline:
-                    _save_codex_state("unified_rss_initialized", "1")
-                # Keep the legacy table current for existing diagnostics/migrations.
-                _prepare_codex_reset_candidates(feed_result, now)
-
-            if isinstance(api_result, Exception):
-                logger.warning("Codex Resets API fetch failed", exc_info=api_result)
-            elif isinstance(api_result, dict):
+            api_result = await _fetch_codex_reset_api()
+            if isinstance(api_result, dict):
                 latest = _api_reset_to_item(
                     ((api_result.get("data") or {}).get("latest_reset") or {})
                 )
                 if latest:
-                    baseline = _load_codex_state("unified_api_initialized") != "1"
-                    if _record_codex_observation(latest, now, baseline=baseline):
-                        candidates.append(latest)
+                    baseline = _load_codex_state("api_only_initialized") != "1"
+                    should_publish = _record_codex_observation(
+                        latest, now, baseline=baseline
+                    )
                     if baseline:
-                        _save_codex_state("unified_api_initialized", "1")
-
-            if candidates and not _has_active_codex_reset_alert():
-                candidates.sort(key=lambda item: (item.get("event_at", 0), item.get("source", "")))
-                async with PIN_LOCK:
-                    if not _has_active_codex_reset_alert():
-                        await _publish_codex_reset_alert(application, candidates[0])
+                        _save_codex_state("api_only_initialized", "1")
+                    if should_publish:
+                        async with PIN_LOCK:
+                            if not _has_active_codex_reset_alert():
+                                await _publish_codex_reset_alert(application, latest)
         except Exception:
-            logger.exception("Codex reset monitor failed")
+            logger.exception("Codex reset API monitor failed")
         await asyncio.sleep(CODEX_RESET_POLL_INTERVAL)
 
 
@@ -2377,43 +2326,37 @@ def _record_codex_observation(item: dict, now: int, baseline: bool = False) -> b
     event_at = int(item.get("event_at") or now)
     conn = sqlite3.connect(MEMORY_DB_PATH)
     try:
+        alert_exists = conn.execute(
+            "SELECT 1 FROM codex_reset_alerts WHERE guid=? LIMIT 1",
+            (event_key,),
+        ).fetchone()
+        if alert_exists:
+            return False
+
         existing = conn.execute(
-            """SELECT notified_at, suppressed_at FROM codex_reset_observations
+            """SELECT notified_at FROM codex_reset_observations
                WHERE source=? AND source_event_id=?""",
             (source, source_event_id),
         ).fetchone()
         if existing:
-            if not baseline and not int(existing[0] or 0):
-                return True
-            return False
+            return not baseline and not int(existing[0] or 0)
 
-        match = conn.execute(
-            """SELECT source, source_event_id, event_key, notified_at
-               FROM codex_reset_observations
-               WHERE event_key=?
-                  OR (source != ? AND ABS(event_at - ?) <= ?)
-               ORDER BY ABS(event_at - ?) ASC LIMIT 1""",
-            (event_key, source, event_at, CODEX_RESET_EVENT_WINDOW_SECONDS, event_at),
-        ).fetchone()
-        already_announced = bool(match and match[3])
-        suppressed_at = now if already_announced else 0
-        correlated_key = str(match[2]) if match else ""
         notified_at = now if baseline else 0
         conn.execute(
             """INSERT INTO codex_reset_observations(
                    source, source_event_id, event_key, event_at, title, text, link,
                    first_seen_at, notified_at, suppressed_at, correlated_event_key
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '')""",
             (
                 source, source_event_id, event_key, event_at,
                 str(item.get("title") or "")[:300],
                 str(item.get("description") or "")[:12000],
                 str(item.get("link") or "")[:1000],
-                now, notified_at, suppressed_at, correlated_key,
+                now, notified_at,
             ),
         )
         conn.commit()
-        return not baseline and not already_announced
+        return not baseline
     finally:
         conn.close()
 
@@ -2494,18 +2437,10 @@ def _format_local_datetime(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, ZoneInfo(PIN_TZ)).strftime("%Y-%m-%d %H:%M")
 
 
-def _format_reset_command(
-    rss_items: list[dict], api_status: Optional[dict]
-) -> str:
-    latest_candidates = []
-    latest_rss = _load_latest_rss_confirmed(rss_items)
-    if latest_rss:
-        latest_candidates.append(_rss_reset_to_item(latest_rss))
-    latest_api = _api_reset_to_item((api_status or {}).get("data", {}).get("latest_reset") or {})
-    if latest_api:
-        latest_candidates.append(latest_api)
-    latest = max(latest_candidates, key=lambda x: x.get("event_at", 0), default=None)
-
+def _format_reset_command(api_status: Optional[dict]) -> str:
+    latest = _api_reset_to_item(
+        (api_status or {}).get("data", {}).get("latest_reset") or {}
+    )
     data = (api_status or {}).get("data") or {}
     scheduled = data.get("scheduled_reset") or {}
     scheduled_for = _parse_iso_timestamp(str(scheduled.get("scheduled_for") or ""))
@@ -4745,19 +4680,12 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _reply_not_allowed_and_cleanup(msg, context)
             return
 
-    feed_result, api_result = await asyncio.gather(
-        _fetch_codex_reset_feed(),
-        _fetch_codex_reset_api(use_etag=False),
-        return_exceptions=True,
-    )
-    rss_items = feed_result if isinstance(feed_result, list) else []
+    api_result = await _fetch_codex_reset_api(use_etag=False)
     api_status = api_result if isinstance(api_result, dict) else None
-    if isinstance(feed_result, Exception):
-        logger.warning("/reset RSS fetch failed", exc_info=feed_result)
     if isinstance(api_result, Exception):
         logger.warning("/reset API fetch failed", exc_info=api_result)
 
-    if not rss_items and api_status is None:
+    if api_status is None:
         await _reply_and_cleanup(
             msg,
             context,
@@ -4766,7 +4694,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    reply = _format_reset_command(rss_items, api_status)
+    reply = _format_reset_command(api_status)
     await _reply_and_cleanup(
         msg,
         context,
