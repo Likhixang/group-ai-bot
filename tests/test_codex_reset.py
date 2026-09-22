@@ -92,3 +92,92 @@ def test_announcement_to_confirmed_transition_is_detected(reset_db):
     ]
     candidates = bot._prepare_codex_reset_candidates(transitioned, 200)
     assert [item["guid"] for item in candidates] == ["tweet-1"]
+
+
+def test_cross_source_same_tweet_is_announced_once(reset_db):
+    rss = bot._rss_reset_to_item({
+        "guid": "tweet-1234567890",
+        "title": "[RESET CONFIRMED] Codex Reset Tracker",
+        "link": "https://x.com/thsottiaux/status/1234567890",
+        "description": "Reset all propagated.",
+        "pub_date": "Tue, 22 Sep 2026 04:00:00 GMT",
+    })
+    api = bot._api_reset_to_item({
+        "id": "1234567890",
+        "reset_type": "regular",
+        "announced_at": "2026-09-22T04:01:00Z",
+        "text": "Reset all propagated.",
+        "source": {"type": "x_post", "url": "https://x.com/thsottiaux/status/1234567890"},
+    })
+    assert rss["event_key"] == api["event_key"]
+    assert bot._record_codex_observation(rss, 100, baseline=False) is True
+    bot._mark_codex_event_notified(rss["event_key"], 77, now=101)
+    assert bot._record_codex_observation(api, 102, baseline=False) is False
+
+
+def test_cross_source_events_within_six_hours_are_deduplicated(reset_db):
+    rss = bot._rss_reset_to_item({
+        "guid": "tweet-1111111111",
+        "title": "[RESET CONFIRMED] Codex Reset Tracker",
+        "link": "https://x.com/thsottiaux/status/1111111111",
+        "description": "Reset all propagated.",
+        "pub_date": "Tue, 22 Sep 2026 04:00:00 GMT",
+    })
+    api = bot._api_reset_to_item({
+        "id": "2222222222",
+        "reset_type": "regular",
+        "announced_at": "2026-09-22T09:00:00Z",
+        "text": "Usage reset completed.",
+        "source": {"type": "x_post", "url": "https://x.com/thsottiaux/status/2222222222"},
+    })
+    assert bot._record_codex_observation(rss, 100, baseline=False) is True
+    bot._mark_codex_event_notified(rss["event_key"], 77, now=101)
+    assert bot._record_codex_observation(api, 102, baseline=False) is False
+
+
+def test_cross_source_api_first_marks_rss_observation(reset_db):
+    rss = bot._rss_reset_to_item({
+        "guid": "tweet-3333333333",
+        "title": "[RESET CONFIRMED] Codex Reset Tracker",
+        "link": "https://x.com/thsottiaux/status/3333333333",
+        "description": "Reset all propagated.",
+        "pub_date": "Tue, 22 Sep 2026 04:00:00 GMT",
+    })
+    api = bot._api_reset_to_item({
+        "id": "4444444444",
+        "reset_type": "regular",
+        "announced_at": "2026-09-22T05:00:00Z",
+        "text": "Usage reset completed.",
+        "source": {"type": "x_post", "url": "https://x.com/thsottiaux/status/4444444444"},
+    })
+    assert bot._record_codex_observation(rss, 100, baseline=False) is True
+    assert bot._record_codex_observation(api, 101, baseline=False) is True
+    bot._mark_codex_event_notified(api["event_key"], 88, now=102)
+    assert bot._record_codex_observation(rss, 103, baseline=False) is False
+
+
+def test_reset_command_uses_api_schedule_and_twitter_link(reset_db):
+    status = {
+        "data": {
+            "latest_reset": {
+                "id": "1234567890",
+                "reset_type": "regular",
+                "announced_at": "2026-09-12T08:09:17Z",
+                "text": "Reset all propagated.",
+                "source": {"type": "x_post", "url": "https://x.com/thsottiaux/status/1234567890"},
+            },
+            "scheduled_reset": {
+                "id": "2222222222",
+                "status": "scheduled",
+                "reset_type": "regular",
+                "announced_at": "2026-09-22T04:31:32Z",
+                "scheduled_for": "2026-09-23T07:00:00Z",
+                "text": "I promised a reset for Tuesday.",
+                "source": {"type": "x_post", "url": "https://x.com/thsottiaux/status/2222222222"},
+            },
+        }
+    }
+    text = bot._format_reset_command([], status)
+    assert "上次重置：2026-09-12 16:09" in text
+    assert "下次预计重置：2026-09-23 15:00" in text
+    assert "https://x.com/thsottiaux/status/2222222222" in text

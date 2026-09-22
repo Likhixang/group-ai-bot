@@ -78,7 +78,9 @@ docker compose logs -f group-ai-bot
 - Configure per-topic strategies (e.g. topic `1`: safe-for-work, topic `45807`: default style)
 - Configure a topic to auto-enable/disable on a schedule (e.g. Beijing time 23:00–05:00 open, closed otherwise)
 - Configure a target topic for automated daily pinned messages (default: Beijing time 00:01)
-- Poll the Codex Reset RSS feed and pin only `[RESET CONFIRMED]` alerts for 30 minutes; the first poll creates a historical baseline without replaying old events
+- Poll both the Codex Reset RSS feed and the Codex Resets API; announce the first confirmed observation and deduplicate matching cross-source events within six hours
+- The `/reset` command shows the latest confirmed reset and the next scheduled reset with its source link; command and reply are deleted after 30 seconds
+- Temporarily pin each confirmed reset alert for 30 minutes; the first poll creates a historical baseline without replaying old events
 - Group chat memory records recent conversation (default 50 items, oldest evicted automatically)
 
 ## 4. Persistent Memory

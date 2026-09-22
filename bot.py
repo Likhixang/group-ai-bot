@@ -3,6 +3,7 @@ import os
 import time
 import json
 import asyncio
+import hashlib
 import ipaddress
 import sqlite3
 import re
@@ -116,7 +117,14 @@ CODEX_RESET_PIN_SECONDS = max(60, int(os.getenv("CODEX_RESET_PIN_SECONDS", "1800
 CODEX_RESET_MAX_DESCRIPTION = max(
     200, int(os.getenv("CODEX_RESET_MAX_DESCRIPTION", "1200"))
 )
-CODEX_RESET_USER_AGENT = "Anyincubation_bot/codex-reset-rss/1.0"
+CODEX_RESET_API_URL = os.getenv(
+    "CODEX_RESET_API_URL", "https://codex-resets.com/api/v1/status"
+).strip()
+CODEX_RESET_EVENT_WINDOW_SECONDS = max(
+    300, int(os.getenv("CODEX_RESET_EVENT_WINDOW_SECONDS", str(6 * 3600)))
+)
+CODEX_RESET_API_ETAG_STATE_KEY = "api_status_etag"
+CODEX_RESET_USER_AGENT = "Anyincubation_bot/codex-reset-monitor/2.0"
 
 BOT_USERNAME: Optional[str] = None
 BOT_ID: Optional[int] = None
@@ -654,34 +662,71 @@ async def _publish_codex_reset_alert(application: Application, item: dict) -> in
         raise
 
     expires_at = int(time.time()) + CODEX_RESET_PIN_SECONDS
-    _save_codex_reset_alert(item["guid"], sent.message_id, expires_at, current)
-    _mark_codex_reset_notified(item["guid"], sent.message_id)
+    alert_guid = str(item.get("event_key") or item.get("guid") or "")[:256]
+    _save_codex_reset_alert(alert_guid, sent.message_id, expires_at, current)
+    _mark_codex_event_notified(alert_guid, sent.message_id)
+    if item.get("source") == "rss" and item.get("guid"):
+        _mark_codex_reset_notified(item["guid"], sent.message_id)
     logger.info(
-        "Codex reset alert published: guid=%s message_id=%s expires_at=%s",
-        item["guid"], sent.message_id, expires_at,
+        "Codex reset alert published: source=%s event_key=%s message_id=%s expires_at=%s",
+        item.get("source"), item.get("event_key"), sent.message_id, expires_at,
     )
     return int(sent.message_id)
 
 
 async def _codex_reset_scheduler_loop(application: Application) -> None:
-    if not CODEX_RESET_ENABLED or not CODEX_RESET_FEED_URL:
-        logger.info("Codex reset RSS alert disabled")
+    if not CODEX_RESET_ENABLED or not CODEX_RESET_FEED_URL or not CODEX_RESET_API_URL:
+        logger.info("Codex reset monitor disabled")
         return
     if not PIN_TARGET_CHAT_ID or not PIN_TARGET_TOPIC_ID:
-        logger.warning("Codex reset RSS alert disabled: pin target is not configured")
+        logger.warning("Codex reset monitor disabled: pin target is not configured")
         return
 
     while True:
         try:
             await _check_due_codex_reset_alerts(application)
-            items = await _fetch_codex_reset_feed()
-            candidates = _prepare_codex_reset_candidates(items, int(time.time()))
+            now = int(time.time())
+            feed_result, api_result = await asyncio.gather(
+                _fetch_codex_reset_feed(),
+                _fetch_codex_reset_api(),
+                return_exceptions=True,
+            )
+            candidates: list[dict] = []
+
+            if isinstance(feed_result, Exception):
+                logger.warning("Codex reset RSS fetch failed", exc_info=feed_result)
+            elif feed_result:
+                confirmed = [item for item in feed_result if _codex_reset_is_confirmed(item)]
+                baseline = _load_codex_state("unified_rss_initialized") != "1"
+                for item in confirmed:
+                    normalized = _rss_reset_to_item(item)
+                    if _record_codex_observation(normalized, now, baseline=baseline):
+                        candidates.append(normalized)
+                if baseline:
+                    _save_codex_state("unified_rss_initialized", "1")
+                # Keep the legacy table current for existing diagnostics/migrations.
+                _prepare_codex_reset_candidates(feed_result, now)
+
+            if isinstance(api_result, Exception):
+                logger.warning("Codex Resets API fetch failed", exc_info=api_result)
+            elif isinstance(api_result, dict):
+                latest = _api_reset_to_item(
+                    ((api_result.get("data") or {}).get("latest_reset") or {})
+                )
+                if latest:
+                    baseline = _load_codex_state("unified_api_initialized") != "1"
+                    if _record_codex_observation(latest, now, baseline=baseline):
+                        candidates.append(latest)
+                    if baseline:
+                        _save_codex_state("unified_api_initialized", "1")
+
             if candidates and not _has_active_codex_reset_alert():
+                candidates.sort(key=lambda item: (item.get("event_at", 0), item.get("source", "")))
                 async with PIN_LOCK:
                     if not _has_active_codex_reset_alert():
                         await _publish_codex_reset_alert(application, candidates[0])
         except Exception:
-            logger.exception("Codex reset RSS scheduler failed")
+            logger.exception("Codex reset monitor failed")
         await asyncio.sleep(CODEX_RESET_POLL_INTERVAL)
 
 
@@ -1825,6 +1870,39 @@ def _init_memory_db() -> None:
             """
         )
         conn.execute(
+            """CREATE TABLE IF NOT EXISTS codex_reset_observations (
+                source TEXT NOT NULL,
+                source_event_id TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                event_at INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL DEFAULT '',
+                link TEXT NOT NULL DEFAULT '',
+                first_seen_at INTEGER NOT NULL,
+                notified_at INTEGER NOT NULL DEFAULT 0,
+                alert_message_id INTEGER NOT NULL DEFAULT 0,
+                suppressed_at INTEGER NOT NULL DEFAULT 0,
+                correlated_event_key TEXT NOT NULL DEFAULT '',
+                baseline INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (source, source_event_id)
+            )"""
+        )
+        for col_sql in (
+            "ALTER TABLE codex_reset_observations ADD COLUMN baseline INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                conn.execute(col_sql)
+            except Exception:
+                pass
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_reset_observations_event "
+            "ON codex_reset_observations(event_key, event_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_reset_observations_time "
+            "ON codex_reset_observations(event_at, source, notified_at)"
+        )
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS codex_reset_state (
                 state_key TEXT PRIMARY KEY,
                 state_value TEXT NOT NULL
@@ -2200,13 +2278,70 @@ def _parse_codex_reset_feed(xml_bytes: bytes) -> list[dict]:
     return items
 
 
-def _codex_reset_sort_key(item: dict) -> tuple:
-    raw = item.get("pub_date") or ""
+def _parse_iso_timestamp(value: str) -> int:
+    raw = (value or "").strip()
+    if not raw:
+        return 0
     try:
-        value = parsedate_to_datetime(raw).timestamp()
+        return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
     except (TypeError, ValueError, OverflowError):
-        value = 0
-    return (value, item.get("guid") or "")
+        return 0
+
+
+def _codex_event_id(value: str) -> str:
+    raw = (value or "").strip()
+    match = re.search(r"(?:tweet[-:]|status/)(\d{8,})", raw, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"status/(\d{8,})", raw, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return raw
+
+
+def _codex_event_key(event_id: str, event_at: int, text: str) -> str:
+    canonical = _codex_event_id(event_id)
+    if canonical and not canonical.startswith("observed-"):
+        return f"tweet:{canonical}"
+    normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+    digest = hashlib.sha256(f"{event_at}:{normalized}".encode()).hexdigest()[:32]
+    return f"text:{digest}"
+
+
+def _api_reset_to_item(reset: dict) -> Optional[dict]:
+    if not isinstance(reset, dict) or not reset.get("id"):
+        return None
+    source = reset.get("source") or {}
+    link = source.get("url") or ""
+    event_at = _parse_iso_timestamp(str(reset.get("announced_at") or ""))
+    text = str(reset.get("text") or "").strip()
+    event_id = str(reset["id"])
+    canonical_source = str(link or event_id)
+    return {
+        "guid": event_id,
+        "title": "[RESET CONFIRMED] Codex Resets API",
+        "link": link,
+        "description": text,
+        "pub_date": str(reset.get("announced_at") or ""),
+        "event_at": event_at,
+        "source": "api",
+        "source_event_id": event_id,
+        "event_key": _codex_event_key(canonical_source, event_at, text),
+        "reset_type": str(reset.get("reset_type") or "regular"),
+    }
+
+
+def _rss_reset_to_item(item: dict) -> dict:
+    event_at = _codex_reset_sort_key(item)[0]
+    event_id = item.get("guid") or item.get("link") or ""
+    return {
+        **item,
+        "event_at": event_at,
+        "source": "rss",
+        "source_event_id": str(item.get("guid") or ""),
+        "event_key": _codex_event_key(event_id, event_at, item.get("description") or ""),
+        "reset_type": "regular",
+    }
 
 
 def _load_codex_state(key: str) -> Optional[str]:
@@ -2218,6 +2353,183 @@ def _load_codex_state(key: str) -> Optional[str]:
     finally:
         conn.close()
     return str(row[0]) if row else None
+
+
+def _save_codex_state(key: str, value: str) -> None:
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        conn.execute(
+            """INSERT INTO codex_reset_state(state_key, state_value)
+               VALUES (?, ?)
+               ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value""",
+            (key, str(value)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _record_codex_observation(item: dict, now: int, baseline: bool = False) -> bool:
+    """Record one source observation and return whether it should be announced."""
+    source = str(item["source"])
+    source_event_id = str(item["source_event_id"])
+    event_key = str(item["event_key"])
+    event_at = int(item.get("event_at") or now)
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        existing = conn.execute(
+            """SELECT notified_at, suppressed_at FROM codex_reset_observations
+               WHERE source=? AND source_event_id=?""",
+            (source, source_event_id),
+        ).fetchone()
+        if existing:
+            if not baseline and not int(existing[0] or 0):
+                return True
+            return False
+
+        match = conn.execute(
+            """SELECT source, source_event_id, event_key, notified_at
+               FROM codex_reset_observations
+               WHERE event_key=?
+                  OR (source != ? AND ABS(event_at - ?) <= ?)
+               ORDER BY ABS(event_at - ?) ASC LIMIT 1""",
+            (event_key, source, event_at, CODEX_RESET_EVENT_WINDOW_SECONDS, event_at),
+        ).fetchone()
+        already_announced = bool(match and match[3])
+        suppressed_at = now if already_announced else 0
+        correlated_key = str(match[2]) if match else ""
+        notified_at = now if baseline else 0
+        conn.execute(
+            """INSERT INTO codex_reset_observations(
+                   source, source_event_id, event_key, event_at, title, text, link,
+                   first_seen_at, notified_at, suppressed_at, correlated_event_key
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                source, source_event_id, event_key, event_at,
+                str(item.get("title") or "")[:300],
+                str(item.get("description") or "")[:12000],
+                str(item.get("link") or "")[:1000],
+                now, notified_at, suppressed_at, correlated_key,
+            ),
+        )
+        conn.commit()
+        return not baseline and not already_announced
+    finally:
+        conn.close()
+
+
+def _mark_codex_event_notified(event_key: str, message_id: int, now: Optional[int] = None) -> None:
+    ts = int(now if now is not None else time.time())
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        related_keys = {str(event_key)}
+        while True:
+            placeholders = ",".join("?" for _ in related_keys)
+            rows = conn.execute(
+                f"""SELECT event_key, correlated_event_key
+                    FROM codex_reset_observations
+                    WHERE event_key IN ({placeholders})
+                       OR correlated_event_key IN ({placeholders})""",
+                tuple(related_keys) + tuple(related_keys),
+            ).fetchall()
+            expanded = set(related_keys)
+            for row_event_key, correlated_event_key in rows:
+                if row_event_key:
+                    expanded.add(str(row_event_key))
+                if correlated_event_key:
+                    expanded.add(str(correlated_event_key))
+            if expanded == related_keys:
+                break
+            related_keys = expanded
+
+        placeholders = ",".join("?" for _ in related_keys)
+        conn.execute(
+            f"""UPDATE codex_reset_observations
+                SET notified_at=?, alert_message_id=?
+                WHERE event_key IN ({placeholders})
+                   OR correlated_event_key IN ({placeholders})""",
+            (ts, int(message_id), *related_keys, *related_keys),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _load_latest_rss_confirmed(items: list[dict]) -> Optional[dict]:
+    confirmed = [item for item in items if _codex_reset_is_confirmed(item)]
+    return max(confirmed, key=_codex_reset_sort_key) if confirmed else None
+
+
+async def _fetch_codex_reset_api(*, use_etag: bool = True) -> Optional[dict]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": CODEX_RESET_USER_AGENT,
+    }
+    if use_etag:
+        etag = _load_codex_state(CODEX_RESET_API_ETAG_STATE_KEY)
+        if etag:
+            headers["If-None-Match"] = etag
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=False) as client:
+        response = await client.get(CODEX_RESET_API_URL, headers=headers)
+    if response.status_code == 304:
+        return None
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After", "")
+        raise RuntimeError(f"Codex Resets API rate limited; retry-after={retry_after}")
+    response.raise_for_status()
+    if len(response.content) > 1 * 1024 * 1024:
+        raise ValueError("Codex Resets API response is too large")
+    if response.headers.get("ETag"):
+        _save_codex_state(CODEX_RESET_API_ETAG_STATE_KEY, response.headers["ETag"])
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+        raise ValueError("Codex Resets API returned an invalid status payload")
+    return payload
+
+
+def _format_local_datetime(timestamp: int) -> str:
+    if not timestamp:
+        return "未知"
+    return datetime.fromtimestamp(timestamp, ZoneInfo(PIN_TZ)).strftime("%Y-%m-%d %H:%M")
+
+
+def _format_reset_command(
+    rss_items: list[dict], api_status: Optional[dict]
+) -> str:
+    latest_candidates = []
+    latest_rss = _load_latest_rss_confirmed(rss_items)
+    if latest_rss:
+        latest_candidates.append(_rss_reset_to_item(latest_rss))
+    latest_api = _api_reset_to_item((api_status or {}).get("data", {}).get("latest_reset") or {})
+    if latest_api:
+        latest_candidates.append(latest_api)
+    latest = max(latest_candidates, key=lambda x: x.get("event_at", 0), default=None)
+
+    data = (api_status or {}).get("data") or {}
+    scheduled = data.get("scheduled_reset") or {}
+    scheduled_for = _parse_iso_timestamp(str(scheduled.get("scheduled_for") or ""))
+    scheduled_link = ((scheduled.get("source") or {}).get("url") or "")
+
+    lines = ["🔄 <b>Codex Reset 状态</b>", ""]
+    lines.append(f"上次重置：{_format_local_datetime(latest['event_at']) if latest else '暂无记录'}")
+    if latest and latest.get("link"):
+        lines.append(f'🔗 <a href="{escape(latest["link"], quote=True)}">上次重置原文</a>')
+    if scheduled_for:
+        lines.append(f"下次预计重置：{_format_local_datetime(scheduled_for)}")
+        if scheduled_link:
+            lines.append(f'🔗 <a href="{escape(scheduled_link, quote=True)}">相关 Twitter</a>')
+    else:
+        lines.append("下次预计重置：暂无")
+    return "\n".join(lines)
+
+def _codex_reset_sort_key(item: dict) -> tuple:
+    raw = item.get("pub_date") or ""
+    try:
+        value = parsedate_to_datetime(raw).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    return (value, item.get("guid") or "")
 
 
 def _prepare_codex_reset_candidates(items: list[dict], now: int) -> list[dict]:
@@ -4412,10 +4724,57 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/allow [用户ID] — 解除 soft ban；空发则全群解禁（仅超管）\n"
             "/pin 内容 — 更新每日置顶（仅超管）\n"
             "/unpin — 取消置顶（仅超管）\n"
+            "/reset — 查询上次重置和下次预计重置（30秒后自动删除）\n"
             "/start — 启动说明"
         )
     # 30秒后自动删除 /help 命令和机器人回复
     asyncio.create_task(_auto_delete_after(msg, reply, context, delay=NOTICE_DELETE_TTL))
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    uid = msg.from_user.id if msg.from_user else None
+    if not _is_private_super_admin(chat, uid):
+        if not _is_allowed_chat(chat):
+            await _reply_not_allowed_and_cleanup(msg, context)
+            return
+        if not _is_allowed_topic(msg):
+            await _reply_not_allowed_and_cleanup(msg, context)
+            return
+
+    feed_result, api_result = await asyncio.gather(
+        _fetch_codex_reset_feed(),
+        _fetch_codex_reset_api(use_etag=False),
+        return_exceptions=True,
+    )
+    rss_items = feed_result if isinstance(feed_result, list) else []
+    api_status = api_result if isinstance(api_result, dict) else None
+    if isinstance(feed_result, Exception):
+        logger.warning("/reset RSS fetch failed", exc_info=feed_result)
+    if isinstance(api_result, Exception):
+        logger.warning("/reset API fetch failed", exc_info=api_result)
+
+    if not rss_items and api_status is None:
+        await _reply_and_cleanup(
+            msg,
+            context,
+            "❌ 暂时无法获取 Codex 重置状态，请稍后再试。",
+            NOTICE_DELETE_TTL,
+        )
+        return
+
+    reply = _format_reset_command(rss_items, api_status)
+    await _reply_and_cleanup(
+        msg,
+        context,
+        reply,
+        NOTICE_DELETE_TTL,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 async def context_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7506,6 +7865,7 @@ async def post_init(application: Application) -> None:
         BotCommand("http", "从全球节点 HTTP 测速"),
         BotCommand("context", "查询模型上下文长度"),
         BotCommand("status", "查看模型可用率（/status 模型名 查单个）"),
+        BotCommand("reset", "查询上次和下次 Codex 重置"),
     ]
     await application.bot.set_my_commands(commands)
     await application.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
@@ -7580,6 +7940,7 @@ def main() -> None:
     app.add_handler(CommandHandler("http", http_cmd))
     app.add_handler(CommandHandler("context", context_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
     # group=-4: 最先执行，被动记录用户媒体 file_id（/dc 无头像兜底）
     app.add_handler(
         MessageHandler(~filters.StatusUpdate.ALL, _track_media_file_id),
