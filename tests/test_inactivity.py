@@ -298,6 +298,45 @@ def test_soft_ban_stops_later_handlers_even_if_delete_fails(monkeypatch):
         asyncio.run(bot.enforce_soft_ban(update, context))
 
 
+def test_soft_ban_stops_later_handlers_during_notice_cooldown(monkeypatch):
+    """Notice throttling must not allow banned commands to reach later handlers."""
+    from telegram.ext import ApplicationHandlerStop
+
+    user_id = 123456
+    chat_id = -100
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=user_id, is_bot=False, full_name="Banned"),
+        message_id=79,
+        text="/force_clear",
+        caption=None,
+    )
+    chat = SimpleNamespace(id=chat_id, type=bot.ChatType.SUPERGROUP)
+    update = SimpleNamespace(effective_message=message, effective_chat=chat)
+    now = int(time.time())
+    key = f"{chat_id}:{user_id}"
+    previous = bot._SOFT_BAN_LAST_NOTICE.get(key)
+    bot._SOFT_BAN_LAST_NOTICE[key] = now
+
+    class FakeBot:
+        async def delete_message(self, **kwargs):
+            return None
+
+    context = SimpleNamespace(bot=FakeBot(), application=SimpleNamespace())
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda _: True)
+    monkeypatch.setattr(bot, "_is_soft_ban_protected_user", lambda _: False)
+    monkeypatch.setattr(bot, "_load_active_ban", lambda *_: (chat_id, user_id, "Banned", 0, 0, 0))
+
+    import asyncio
+    try:
+        with pytest.raises(ApplicationHandlerStop):
+            asyncio.run(bot.enforce_soft_ban(update, context))
+    finally:
+        if previous is None:
+            bot._SOFT_BAN_LAST_NOTICE.pop(key, None)
+        else:
+            bot._SOFT_BAN_LAST_NOTICE[key] = previous
+
+
 def test_soft_ban_notice_state_is_separate_from_ban_record(activity_db):
     """A repeated-message notice needs one mutable message id per chat/user."""
     bot._save_soft_ban_notice(-100, 42, 9001, 123456)
