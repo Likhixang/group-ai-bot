@@ -32,6 +32,7 @@ from telegram.constants import ChatMemberStatus, ChatType, MessageEntityType, Pa
 from telegram.error import BadRequest, TimedOut
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
@@ -6438,7 +6439,7 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     now_ts = int(time.time())
     last = _SOFT_BAN_LAST_NOTICE.get(key, 0)
     if now_ts - last < SOFT_BAN_REPEAT_COOLDOWN:
-        return
+        raise ApplicationHandlerStop
     _SOFT_BAN_LAST_NOTICE[key] = now_ts
 
     mention = _html_user_mention(user.id, display)
@@ -6470,7 +6471,9 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 _delete_messages_later(context, chat.id, [mid], SOFT_BAN_NOTICE_TTL)
             )
             _SOFT_BAN_NOTICE_DELETE_TASKS[key] = new_task
-            return
+            raise ApplicationHandlerStop
+        except ApplicationHandlerStop:
+            raise
         except Exception:
             # 编辑失败（消息已被定时删除等），退到发新消息
             _remove_soft_ban_notice(chat.id, user.id)
@@ -6499,6 +6502,10 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             user.id,
             exc_info=True,
         )
+
+    # Stop this update even when Telegram refuses deletion or reminder delivery;
+    # a soft-banned user must never reach command/AI handlers.
+    raise ApplicationHandlerStop
 
 
 # 链接检测：检测消息中是否包含任意 URL 或富文本超链接（包含实体 entities/caption_entities 及正则兜底）。

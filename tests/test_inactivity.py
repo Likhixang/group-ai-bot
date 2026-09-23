@@ -220,6 +220,84 @@ def test_soft_ban_protected_users():
         bot.BOT_ID = old
 
 
+def test_soft_ban_stops_later_handler_groups(monkeypatch):
+    """A banned command must be stopped before any later command/AI handler."""
+    from telegram.ext import ApplicationHandlerStop
+
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=123456, is_bot=False, full_name="Banned"),
+        message_id=77,
+        text="/force_clear",
+        caption=None,
+    )
+    chat = SimpleNamespace(id=-100, type=bot.ChatType.SUPERGROUP)
+    update = SimpleNamespace(effective_message=message, effective_chat=chat)
+    events = []
+
+    class FakeBot:
+        async def delete_message(self, **kwargs):
+            events.append("delete")
+
+        async def send_message(self, **kwargs):
+            events.append("notice")
+            return SimpleNamespace(message_id=88)
+
+    class FakeApplication:
+        def create_task(self, coro):
+            coro.close()
+            return SimpleNamespace(cancel=lambda: None)
+
+    context = SimpleNamespace(bot=FakeBot(), application=FakeApplication())
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda _: True)
+    monkeypatch.setattr(bot, "_is_soft_ban_protected_user", lambda _: False)
+    monkeypatch.setattr(bot, "_load_active_ban", lambda *_: (-100, 123456, "Banned", 0, 0, 0))
+    monkeypatch.setattr(bot, "_load_soft_ban_notice", lambda *_: None)
+    monkeypatch.setattr(bot, "_save_soft_ban_notice", lambda *_args, **_kwargs: None)
+
+    async def assert_stopped():
+        try:
+            await bot.enforce_soft_ban(update, context)
+        except ApplicationHandlerStop:
+            events.append("stopped")
+        else:
+            pytest.fail("soft-banned update continued into later handler groups")
+
+    import asyncio
+    asyncio.run(assert_stopped())
+    assert events == ["delete", "notice", "stopped"]
+
+
+def test_soft_ban_stops_later_handlers_even_if_delete_fails(monkeypatch):
+    """Telegram API errors must not let a banned user invoke commands."""
+    from telegram.ext import ApplicationHandlerStop
+
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=123456, is_bot=False, full_name="Banned"),
+        message_id=78,
+        text="/clear",
+        caption=None,
+    )
+    chat = SimpleNamespace(id=-100, type=bot.ChatType.SUPERGROUP)
+    update = SimpleNamespace(effective_message=message, effective_chat=chat)
+
+    class FakeBot:
+        async def delete_message(self, **kwargs):
+            raise RuntimeError("delete denied")
+
+        async def send_message(self, **kwargs):
+            raise RuntimeError("notice failed")
+
+    context = SimpleNamespace(bot=FakeBot(), application=SimpleNamespace())
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda _: True)
+    monkeypatch.setattr(bot, "_is_soft_ban_protected_user", lambda _: False)
+    monkeypatch.setattr(bot, "_load_active_ban", lambda *_: (-100, 123456, "Banned", 0, 0, 0))
+    monkeypatch.setattr(bot, "_load_soft_ban_notice", lambda *_: None)
+
+    import asyncio
+    with pytest.raises(ApplicationHandlerStop):
+        asyncio.run(bot.enforce_soft_ban(update, context))
+
+
 def test_soft_ban_notice_state_is_separate_from_ban_record(activity_db):
     """A repeated-message notice needs one mutable message id per chat/user."""
     bot._save_soft_ban_notice(-100, 42, 9001, 123456)
