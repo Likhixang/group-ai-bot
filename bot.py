@@ -6508,72 +6508,6 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     raise ApplicationHandlerStop
 
 
-# 链接检测：检测消息中是否包含任意 URL 或富文本超链接（包含实体 entities/caption_entities 及正则兜底）。
-# 生效规则见 enforce_link_rule。
-
-
-def _message_contains_link(msg: Message) -> bool:
-    """Check if message contains links via Telegram entities or fallback URL pattern."""
-    if not msg:
-        return False
-
-    # Check text entities
-    for ent in (msg.entities or ()):
-        if ent.type in (MessageEntityType.URL, MessageEntityType.TEXT_LINK):
-            return True
-        if getattr(ent, "url", None):
-            return True
-
-    # Check caption entities (media messages)
-    for ent in (msg.caption_entities or ()):
-        if ent.type in (MessageEntityType.URL, MessageEntityType.TEXT_LINK):
-            return True
-        if getattr(ent, "url", None):
-            return True
-
-    # Fallback to URL_PATTERN regex check on raw text or caption
-    text = msg.text or msg.caption or ""
-    if text and URL_PATTERN.search(text):
-        return True
-
-    return False
-
-
-async def enforce_link_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """群内消息包含链接时，仅回复固定的风险提示。"""
-    msg = update.effective_message
-    chat = update.effective_chat
-    if not msg or not chat:
-        return
-    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        return
-    if not _is_allowed_chat(chat):
-        return
-
-    user = msg.from_user
-    if not user or getattr(user, "is_bot", False):
-        return
-    if _is_soft_ban_protected_user(user.id):
-        return
-    # Bot commands are handled by CommandHandler; never treat their arguments
-    # (for example `/ip 8.8.8.8`) as link messages.
-    if (msg.text or "").lstrip().startswith("/"):
-        return
-    if not _message_contains_link(msg):
-        return
-
-    try:
-        await msg.reply_text("链接未经验证，谨慎参考")
-    except Exception:
-        logger.warning(
-            "link_rule: warning reply failed chat=%s user=%s msg=%s",
-            chat.id,
-            user.id,
-            msg.message_id,
-            exc_info=True,
-        )
-
-
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Silently record any group member activity for inactivity warnings.
 
@@ -7912,11 +7846,6 @@ def main() -> None:
     app.add_handler(
         MessageHandler(~filters.StatusUpdate.ALL, _track_media_file_id),
         group=-4,
-    )
-    # group=-3: 任意链接检测（最先执行，超管豁免；优先于 soft ban 删消息）
-    app.add_handler(
-        MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, enforce_link_rule),
-        group=-3,
     )
     # group=-2: soft ban 删消息（优先）
     app.add_handler(
