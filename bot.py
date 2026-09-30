@@ -7806,6 +7806,15 @@ def validate_env() -> None:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
 
+async def ignore_edited_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Do not replay old requests when Telegram updates profile/tag metadata.
+
+    edited_message can arrive even when the message text has not changed.
+    Stop before media tracking, moderation, activity, commands and AI handlers.
+    """
+    raise ApplicationHandlerStop
+
+
 def main() -> None:
     validate_env()
     _init_memory_db()
@@ -7816,6 +7825,11 @@ def main() -> None:
         .concurrent_updates(MAX_CONCURRENT_UPDATES)
         .post_init(post_init)
         .build()
+    )
+
+    app.add_handler(
+        MessageHandler(filters.UpdateType.EDITED, ignore_edited_update),
+        group=-5,
     )
 
     app.add_handler(CommandHandler("start", start))
