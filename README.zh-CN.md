@@ -60,7 +60,7 @@ docker compose logs -f group-ai-bot
 
 ## 3. 群里使用
 
-- 单独发送 HEX 颜色代码（`#RGB`、`#RRGGBB` 或 `RRGGBB`，大小写均可），直接回复生成的 52×52 PNG 色块，不调用 AI；沿用现有群组/话题权限，普通文字和编辑消息不触发。
+- 单独发送 HEX 颜色代码（`#RGB`、`#RRGGBB` 或 `RRGGBB`，大小写均可），直接回复生成的 52×52 PNG 色块，不调用 AI；输入消息和色块回复按全局清理 TTL（当前 30 秒）一起删除。沿用现有群组/话题权限，普通文字和编辑消息不触发。
 - `grok 你的问题`（文本快模：`grok-4-1-fast`）
 - `grokt 你的问题`（文本深度思考：`grok-4-1-thinking`）
 - `oai 你的问题` 或 `/oai 你的问题`（GPT 模型：`gpt-5.5`）

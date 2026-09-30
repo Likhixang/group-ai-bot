@@ -5780,12 +5780,16 @@ async def on_hex_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ):
             raise ApplicationHandlerStop
     color, photo = _hex_color_png(msg.text or "")
+    sent = None
     try:
-        await msg.reply_photo(photo=photo, caption=color, do_quote=True)
+        sent = await msg.reply_photo(photo=photo, caption=color, do_quote=True)
     except Exception:
         logger.exception("Failed to send HEX color swatch")
     finally:
         photo.close()
+        context.application.create_task(
+            _auto_delete_after(msg, sent, context, delay=NOTICE_DELETE_TTL)
+        )
     # Do not also invoke text AI when the code replies to a bot message.
     raise ApplicationHandlerStop
 

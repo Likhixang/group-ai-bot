@@ -129,6 +129,9 @@ def test_rename_does_not_change_memory_key(application):
 async def test_hex_stops_ai_routing_and_quotes_original(application, monkeypatch, reply_kind, send_fails):
     app, callbacks = application
     callbacks["on_hex_color"].side_effect = bot.on_hex_color
+    monkeypatch.setattr(bot, "_auto_delete_after", AsyncMock())
+    cleanup_tasks = []
+    monkeypatch.setattr(Application, "create_task", lambda self, coro: cleanup_tasks.append(coro))
     monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
     monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
     send_photo = AsyncMock(side_effect=RuntimeError("Telegram unavailable") if send_fails else None)
@@ -149,6 +152,8 @@ async def test_hex_stops_ai_routing_and_quotes_original(application, monkeypatch
             ]
         data["message"]["reply_to_message"] = replied
     await app.process_update(Update.de_json(data, app.bot))
+    assert len(cleanup_tasks) == 1
+    await cleanup_tasks[0]
     send_photo.assert_awaited_once()
     kwargs = send_photo.call_args.kwargs
     assert kwargs["caption"] == "#ABC123"

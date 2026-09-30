@@ -4,7 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from PIL import Image
@@ -76,7 +76,57 @@ def test_reply_and_permissions(monkeypatch, chat_type, uid, allow_chat, allow_to
     reply = AsyncMock(side_effect=reply_photo)
     msg = SimpleNamespace(text="#f00", from_user=SimpleNamespace(id=uid), reply_photo=reply)
     update = SimpleNamespace(effective_message=msg, effective_chat=SimpleNamespace(type=chat_type))
+    cleanup = AsyncMock()
+    monkeypatch.setattr(bot, "_auto_delete_after", cleanup)
+    schedule = Mock(side_effect=lambda coro: coro.close())
+    context = SimpleNamespace(application=SimpleNamespace(create_task=schedule))
     with pytest.raises(bot.ApplicationHandlerStop):
-        asyncio.run(bot.on_hex_color(update, SimpleNamespace()))
+        asyncio.run(bot.on_hex_color(update, context))
+    assert schedule.call_count == int(should_send)
+    assert cleanup.call_count == int(should_send)
     assert reply.await_count == int(should_send)
     assert all(photo.closed for photo in photos)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ttl", [30, 7])
+@pytest.mark.parametrize("send_fails", [False, True])
+@pytest.mark.parametrize("source_already_deleted", [False, True])
+async def test_cleanup_uses_global_ttl_and_deletes_both_messages(
+    monkeypatch, ttl, send_fails, source_already_deleted
+):
+    monkeypatch.setattr(bot, "NOTICE_DELETE_TTL", ttl)
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
+    monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
+    sleep = AsyncMock()
+    monkeypatch.setattr(bot.asyncio, "sleep", sleep)
+    sent = SimpleNamespace(chat_id=-100123, message_id=102)
+    reply = AsyncMock(return_value=sent)
+    if send_fails:
+        reply.side_effect = RuntimeError("Telegram unavailable")
+    msg = SimpleNamespace(
+        text="#f00", from_user=SimpleNamespace(id=1), reply_photo=reply,
+        chat_id=-100123, message_id=101,
+        reply_to_message=SimpleNamespace(chat_id=-100123, message_id=100),
+    )
+    delete = AsyncMock(side_effect=[RuntimeError("already deleted"), True]
+                       if source_already_deleted else None)
+    pending = []
+    context = SimpleNamespace(
+        bot=SimpleNamespace(delete_message=delete),
+        application=SimpleNamespace(create_task=pending.append),
+    )
+    update = SimpleNamespace(
+        effective_message=msg, effective_chat=SimpleNamespace(type="supergroup")
+    )
+    with pytest.raises(bot.ApplicationHandlerStop):
+        await bot.on_hex_color(update, context)
+    assert len(pending) == 1
+    # Scheduling must not block the handler or delete before the delay.
+    delete.assert_not_awaited()
+    await pending[0]
+    sleep.assert_awaited_once_with(ttl)
+    expected = [call(chat_id=-100123, message_id=101)]
+    if not send_fails:
+        expected.append(call(chat_id=-100123, message_id=102))
+    assert delete.await_args_list == expected
