@@ -60,6 +60,7 @@ docker compose logs -f group-ai-bot
 
 ## 3. Usage in Groups
 
+- Send a standalone HEX color (`#RGB`, `#RRGGBB`, or `RRGGBB`, case-insensitive) to get a 52×52 color swatch generated as PNG, without calling AI. Existing chat/topic permissions apply; normal text and edited messages do not trigger it.
 - `grok your question` (fast text model: `grok-4-1-fast`)
 - `grokt your question` (deep-thinking text: `grok-4-1-thinking`)
 - `oai your question` or `/oai your question` (GPT model: `gpt-5.5`)

@@ -5746,6 +5746,50 @@ async def av_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _schedule_av_cleanup(context, chat.id, source_message, msg, status)
 
 
+HEX_COLOR_PATTERN = re.compile(r"\A\s*(?:#[0-9a-fA-F]{3}|#?[0-9a-fA-F]{6})\s*\Z")
+
+
+def _hex_color_png(text: str) -> tuple[str, BytesIO]:
+    """Render a standalone RGB HEX code without invoking an image API."""
+    if not HEX_COLOR_PATTERN.fullmatch(text):
+        raise ValueError("Expected #RGB, #RRGGBB or RRGGBB")
+    digits = text.strip().removeprefix("#")
+    if len(digits) == 3:
+        digits = "".join(char * 2 for char in digits)
+    color = f"#{digits.upper()}"
+    output = BytesIO()
+    with Image.new("RGB", (52, 52), color) as image:
+        image.save(output, format="PNG")
+    output.name = f"{digits.upper()}.png"
+    output.seek(0)
+    return color, output
+
+
+async def on_hex_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply with a swatch before image-edit and text-AI routing."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat or not HEX_COLOR_PATTERN.fullmatch(msg.text or ""):
+        return
+    uid = msg.from_user.id if msg.from_user else None
+    if not _is_private_super_admin(chat, uid):
+        if (
+            chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}
+            or not _is_allowed_chat(chat)
+            or not _is_allowed_topic(msg)
+        ):
+            raise ApplicationHandlerStop
+    color, photo = _hex_color_png(msg.text or "")
+    try:
+        await msg.reply_photo(photo=photo, caption=color, do_quote=True)
+    except Exception:
+        logger.exception("Failed to send HEX color swatch")
+    finally:
+        photo.close()
+    # Do not also invoke text AI when the code replies to a bot message.
+    raise ApplicationHandlerStop
+
+
 async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     chat = update.effective_chat
@@ -7874,6 +7918,9 @@ def main() -> None:
     app.add_handler(
         ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER),
         group=-1,
+    )
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(HEX_COLOR_PATTERN), on_hex_color)
     )
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, on_image_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_image_request))

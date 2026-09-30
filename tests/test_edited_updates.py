@@ -87,7 +87,7 @@ def make_update(app, kind, body):
 @pytest.mark.parametrize(
     "kind", ["edited_message", "edited_channel_post", "edited_business_message"]
 )
-@pytest.mark.parametrize("body", ["ds old question", "/ds old question", "/force_clear", "photo", "old reply"])
+@pytest.mark.parametrize("body", ["ds old question", "/ds old question", "/force_clear", "photo", "old reply", "#aBc123"])
 async def test_edited_updates_never_reach_side_effect_handlers(application, kind, body):
     app, callbacks = application
     await app.process_update(make_update(app, kind, body))
@@ -121,3 +121,48 @@ def test_rename_does_not_change_memory_key(application):
     data["message"]["from"]["username"] = "another_tag"
     renamed = Update.de_json(data, app.bot)
     assert bot._memory_key(original) == bot._memory_key(renamed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_kind", [None, "text", "photo"])
+@pytest.mark.parametrize("send_fails", [False, True])
+async def test_hex_stops_ai_routing_and_quotes_original(application, monkeypatch, reply_kind, send_fails):
+    app, callbacks = application
+    callbacks["on_hex_color"].side_effect = bot.on_hex_color
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
+    monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
+    send_photo = AsyncMock(side_effect=RuntimeError("Telegram unavailable") if send_fails else None)
+    monkeypatch.setattr(type(app.bot), "send_photo", send_photo)
+    data = make_update(app, "message", "#aBc123").to_dict()
+    data["message"]["is_topic_message"] = True
+    data["message"]["message_thread_id"] = 456
+    if reply_kind:
+        replied = {
+            "message_id": 76, "date": 1700000000, "chat": data["message"]["chat"],
+            "from": {"id": 999, "is_bot": True, "first_name": "Bot"},
+        }
+        if reply_kind == "text":
+            replied["text"] = "previous AI answer"
+        else:
+            replied["photo"] = [
+                {"file_id": "image", "file_unique_id": "image", "width": 52, "height": 52}
+            ]
+        data["message"]["reply_to_message"] = replied
+    await app.process_update(Update.de_json(data, app.bot))
+    send_photo.assert_awaited_once()
+    kwargs = send_photo.call_args.kwargs
+    assert kwargs["caption"] == "#ABC123"
+    assert kwargs["message_thread_id"] == 456
+    assert kwargs["reply_parameters"].message_id == 77
+    callbacks["on_image_request"].assert_not_awaited()
+    callbacks["on_text"].assert_not_awaited()
+    callbacks["enforce_soft_ban"].assert_awaited_once()
+    callbacks["track_activity"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_soft_ban_stops_hex_reply(application):
+    app, callbacks = application
+    callbacks["enforce_soft_ban"].side_effect = bot.ApplicationHandlerStop
+    await app.process_update(make_update(app, "message", "#abcdef"))
+    callbacks["on_hex_color"].assert_not_awaited()
