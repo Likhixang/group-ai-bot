@@ -65,7 +65,7 @@ AI_THINKING_MODEL = os.getenv("AI_THINKING_MODEL", "ds-4.1-thinking").strip()
 OAI_MODEL = os.getenv("OAI_MODEL", "gpt-5.5").strip()
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
-LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-5.6-luna").strip()
+LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-6-luna").strip()
 LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
@@ -600,27 +600,36 @@ async def _translate_codex_reset_text(text: str) -> str:
     original = (text or "").strip()
     if not original:
         return ""
-    try:
-        translated = await _ask_ai_once(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是专业技术信息翻译器。将用户提供的英文公告翻译成自然、准确的简体中文。"
-                        "只输出译文，不要解释、摘要、前缀或引号。保留 URL、数字、产品名、模型名、"
-                        "API 和专有名词；不要翻译 URL。"
-                    ),
-                },
-                {"role": "user", "content": original},
-            ],
-            LUNA_MODEL,
-            temperature=0.1,
-        )
-        translated = (translated or "").strip()
-        if translated:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是专业技术信息翻译器。将用户提供的英文公告翻译成自然、准确的简体中文。"
+                "只输出译文，不要解释、摘要、前缀或引号。保留 URL、数字、产品名、模型名、"
+                "API 和专有名词；不要翻译 URL。"
+            ),
+        },
+        {"role": "user", "content": original},
+    ]
+    retry_delays = (2, 4)
+    attempts = len(retry_delays) + 1
+    for attempt in range(attempts):
+        try:
+            translated = await _ask_ai_once(messages, LUNA_MODEL, temperature=0.1)
+            translated = (translated or "").strip()
+            if not translated:
+                raise RuntimeError("empty translation response")
             return translated[:CODEX_RESET_MAX_DESCRIPTION]
-    except Exception as exc:
-        logger.warning("Codex reset translation failed; using original text: %s", exc)
+        except Exception as exc:
+            logger.warning(
+                "Codex reset translation attempt %s/%s failed: %s",
+                attempt + 1, attempts, exc,
+            )
+            if attempt < len(retry_delays):
+                await asyncio.sleep(retry_delays[attempt])
+    logger.warning(
+        "Codex reset translation failed after %s attempts; using original text", attempts
+    )
     return original[:CODEX_RESET_MAX_DESCRIPTION]
 
 

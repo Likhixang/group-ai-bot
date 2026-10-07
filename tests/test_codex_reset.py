@@ -128,16 +128,69 @@ async def test_codex_reset_translation_uses_luna(monkeypatch):
         "GPT-6 Sol and Luna are out. https://t.co/example"
     )
     assert translated == "GPT-6 Sol 和 Luna 已发布。"
-    assert calls["model"] == "gpt-5.6-luna"
+    assert calls["model"] == "gpt-6-luna"
     assert calls["temperature"] == 0.1
     assert calls["messages"][1]["content"].endswith("https://t.co/example")
 
 
+@pytest.mark.parametrize("text", ["/ln", "ln", "/ln hello", "ln hello"])
+def test_luna_command_and_prefix_use_gpt_6_luna(text):
+    assert bot._select_text_model(text) == "gpt-6-luna"
+
+
 @pytest.mark.asyncio
-async def test_codex_reset_translation_falls_back_to_original(monkeypatch):
+@pytest.mark.parametrize("first_result", ["error", "", "   "])
+async def test_codex_reset_translation_retries_before_success(monkeypatch, first_result):
+    calls = []
+    delays = []
+
+    async def flaky_ask(*args, **kwargs):
+        calls.append(args[1])
+        if len(calls) == 1:
+            if first_result == "error":
+                raise RuntimeError("temporary translation failure")
+            return first_result
+        return "重置已完成。"
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(bot, "_ask_ai_once", flaky_ask)
+    monkeypatch.setattr(bot.asyncio, "sleep", fake_sleep)
+    assert await bot._translate_codex_reset_text("Reset all propagated.") == "重置已完成。"
+    assert calls == ["gpt-6-luna", "gpt-6-luna"]
+    assert delays == [2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_response", [False, True])
+async def test_codex_reset_translation_falls_back_only_after_three_attempts(
+    monkeypatch, empty_response
+):
+    calls = []
+    delays = []
+
     async def failing_ask(*args, **kwargs):
+        calls.append(args[1])
+        if empty_response:
+            return ""
         raise RuntimeError("translation unavailable")
 
+    async def fake_sleep(delay):
+        delays.append(delay)
+
     monkeypatch.setattr(bot, "_ask_ai_once", failing_ask)
+    monkeypatch.setattr(bot.asyncio, "sleep", fake_sleep)
     original = "Reset all propagated. https://x.com/example/status/123"
     assert await bot._translate_codex_reset_text(original) == original
+    assert len(calls) == 3
+    assert delays == [2, 4]
+
+
+@pytest.mark.asyncio
+async def test_codex_reset_translation_skips_empty_source(monkeypatch):
+    async def unexpected_ask(*args, **kwargs):
+        pytest.fail("empty source should not call AI")
+
+    monkeypatch.setattr(bot, "_ask_ai_once", unexpected_ask)
+    assert await bot._translate_codex_reset_text("   ") == ""
