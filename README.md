@@ -81,7 +81,9 @@ docker compose logs -f group-ai-bot
 - Configure a target topic for automated daily pinned messages (default: Beijing time 00:01)
 - Monitor the official Codex Resets API and announce each newly reported reset; the first successful poll creates a historical baseline without replaying old events
 - The `/reset` command shows the latest confirmed reset and the next scheduled reset with its source link; command and reply are deleted after 30 seconds
-- Translate reset alerts into simplified Chinese with `LUNA_MODEL` (default: `gpt-6-luna`, shared with `/ln` and `ln`); retry failures or empty responses up to 3 total attempts, waiting 2 and 4 seconds before falling back to the original text
+- Validate and fetch the full source X post (including long posts) before translation; keep only the footer source link. Retry source failures 3 times, then defer to the next poll instead of publishing incomplete API text
+- Translate reset alerts into simplified Chinese with `LUNA_MODEL` (default: `gpt-6-luna`, shared with `/ln` and `ln`); retry failures or empty responses up to 3 total attempts, waiting 2 and 4 seconds before falling back to the complete original text
+- Do not silently truncate alerts at 1200 characters; reject messages exceeding Telegram's 4096-unit limit before changing pins or sending
 - Temporarily pin each confirmed reset alert for 30 minutes; the first poll creates a historical baseline without replaying old events
 - Group chat memory records recent conversation (default 50 items, oldest evicted automatically)
 

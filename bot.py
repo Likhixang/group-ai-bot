@@ -14,6 +14,7 @@ from email.utils import parsedate_to_datetime
 from io import BytesIO
 from collections import defaultdict
 from html import escape, unescape
+from html.parser import HTMLParser
 from typing import Optional
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -596,6 +597,114 @@ async def _check_due_codex_reset_alerts(application: Application) -> None:
         await _expire_codex_reset_alert(application, alert)
 
 
+def _strip_codex_body_urls(text: str) -> str:
+    """Keep the source link separately; URLs are not part of the alert body."""
+    text = re.sub(
+        r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'*+,;=%]+", "", text or "",
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"[ \t]+\n", "\n", text).strip()
+
+
+def _validate_codex_source_url(url: str) -> str:
+    if not re.fullmatch(
+        r"https://(?:x\.com|twitter\.com)/[A-Za-z0-9_]+/status/[0-9]{8,}", url or ""
+    ):
+        raise ValueError("Codex reset source must be an HTTPS X post URL")
+    return url
+
+
+class _CodexSourcePageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.canonical = ""
+        self.scripts = []
+        self._script = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "link" and attrs.get("rel") == "canonical":
+            self.canonical = attrs.get("href") or ""
+        if tag == "script":
+            self._script = []
+
+    def handle_data(self, data):
+        if self._script is not None:
+            self._script.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self._script is not None:
+            self.scripts.append("".join(self._script))
+            self._script = None
+
+
+def _parse_codex_source_post(html: str, source_url: str) -> str:
+    """Read X's focal-post SSR bodyText (includes NoteTweet), not its preview."""
+    _validate_codex_source_url(source_url)
+    parser = _CodexSourcePageParser()
+    parser.feed(html)
+    expected_path = urllib.parse.urlsplit(source_url).path
+    if parser.canonical not in {
+        f"https://x.com{expected_path}", f"https://twitter.com{expected_path}"
+    }:
+        raise ValueError("X page canonical does not match reset source")
+    # bodyText belongs to focal-post metadata and is followed by its canonical URL.
+    # Do not use full_text/og:description: those can contain a 280-character preview.
+    json_string = r'"(?:\\.|[^"\\])*"'
+    pattern = (
+        r'\bbodyText\s*:\s*(' + json_string + r')\s*,\s*canonicalPath\s*:\s*'
+        + json_string + r'\s*,\s*canonicalUrl\s*:\s*(' + json_string + r')'
+    )
+    texts = []
+    for script in parser.scripts:
+        for match in re.finditer(pattern, script):
+            text, canonical = (json.loads(value) for value in match.groups())
+            if canonical == parser.canonical and text.strip():
+                texts.append(text.strip())
+    if not texts or len(set(texts)) != 1:
+        raise ValueError("X full focal-post text is missing or ambiguous")
+    text = texts[0]
+    if text.endswith(("…", "...")):
+        raise ValueError("X source text appears truncated")
+    return text
+
+
+async def _fetch_codex_source_post(source_url: str) -> str:
+    _validate_codex_source_url(source_url)
+    retry_delays = (2, 4)
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=False, trust_env=False,
+            ) as client:
+                response = await client.get(source_url, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            if response.is_redirect or len(response.content) > 4 * 1024 * 1024:
+                raise ValueError("X source redirected or response is too large")
+            return _parse_codex_source_post(response.text, source_url)
+        except Exception as exc:
+            logger.warning("Codex reset source attempt %s/3 failed: %s", attempt + 1, exc)
+            if attempt < 2:
+                await asyncio.sleep(retry_delays[attempt])
+    raise RuntimeError("Codex reset full source unavailable; defer alert until next poll")
+
+
+async def _prepare_codex_reset_alert(item: dict) -> dict:
+    prepared = dict(item)
+    source_url = str(item.get("link") or "")
+    original = await _fetch_codex_source_post(source_url)
+    prepared["description"] = _strip_codex_body_urls(
+        await _translate_codex_reset_text(_strip_codex_body_urls(original))
+    )
+    # Fail before changing the current pin or sending, rather than silently cut text.
+    formatted = _format_codex_reset_alert(prepared)
+    visible = re.sub(r'<[^>]+>', '', formatted)
+    if len(unescape(visible).encode("utf-16-le")) // 2 > 4096:
+        raise ValueError("Codex reset full alert exceeds Telegram message limit")
+    return prepared
+
+
 async def _translate_codex_reset_text(text: str) -> str:
     original = (text or "").strip()
     if not original:
@@ -619,7 +728,7 @@ async def _translate_codex_reset_text(text: str) -> str:
             translated = (translated or "").strip()
             if not translated:
                 raise RuntimeError("empty translation response")
-            return translated[:CODEX_RESET_MAX_DESCRIPTION]
+            return translated
         except Exception as exc:
             logger.warning(
                 "Codex reset translation attempt %s/%s failed: %s",
@@ -630,14 +739,11 @@ async def _translate_codex_reset_text(text: str) -> str:
     logger.warning(
         "Codex reset translation failed after %s attempts; using original text", attempts
     )
-    return original[:CODEX_RESET_MAX_DESCRIPTION]
+    return original
 
 
 async def _publish_codex_reset_alert(application: Application, item: dict) -> int:
-    translated_item = dict(item)
-    translated_item["description"] = await _translate_codex_reset_text(
-        item.get("description") or ""
-    )
+    translated_item = await _prepare_codex_reset_alert(item)
     current = _load_managed_pin(PIN_TARGET_CHAT_ID, PIN_TARGET_TOPIC_ID)
     if current and current.get("message_id"):
         try:
@@ -716,7 +822,12 @@ async def _codex_reset_scheduler_loop(application: Application) -> None:
                         async with PIN_LOCK:
                             if not _has_active_codex_reset_alert():
                                 await _publish_codex_reset_alert(application, latest)
+                            else:
+                                # Re-fetch an unnotified event after the old pin expires.
+                                _save_codex_state(CODEX_RESET_API_ETAG_STATE_KEY, "")
         except Exception:
+            # A failed publish must not be skipped by a subsequent HTTP 304.
+            _save_codex_state(CODEX_RESET_API_ETAG_STATE_KEY, "")
             logger.exception("Codex reset API monitor failed")
         await asyncio.sleep(CODEX_RESET_POLL_INTERVAL)
 
@@ -2675,7 +2786,8 @@ def _format_codex_reset_alert(item: dict) -> str:
     description = re.split(
         r"\n\s*Classifier Rationale:\s*", item.get("description") or "", maxsplit=1,
         flags=re.IGNORECASE,
-    )[0].strip()[:CODEX_RESET_MAX_DESCRIPTION]
+    )[0].strip()
+    description = _strip_codex_body_urls(description)
     lines = ["🚨 <b>Codex 重置已确认</b>"]
     if description:
         lines.extend(["", escape(description)])
