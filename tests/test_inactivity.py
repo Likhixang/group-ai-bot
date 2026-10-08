@@ -1,4 +1,4 @@
-"""Unit tests for inactivity tracking / warning / remind2 / kick helpers + soft ban."""
+"""Regression tests for soft ban and removal of automatic inactivity moderation."""
 import os
 import importlib.util
 import sqlite3
@@ -25,128 +25,6 @@ def activity_db(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "MEMORY_DB_PATH", str(db_path))
     bot._init_memory_db()
     return str(db_path)
-
-
-def test_touch_and_load_inactive(activity_db):
-    now = int(time.time())
-    old = now - 31 * 24 * 3600
-    bot._touch_user_activity(-100, 1, "Old User", ts=old)
-    bot._touch_user_activity(-100, 2, "Fresh User", ts=now)
-
-    threshold = now - 30 * 24 * 3600
-    rows = bot._load_inactive_users(threshold, limit=10)
-    assert len(rows) == 1
-    assert rows[0][1] == 1
-
-
-def test_warn_once_then_skip_until_activity(activity_db):
-    now = int(time.time())
-    old = now - 40 * 24 * 3600
-    bot._touch_user_activity(-100, 7, "Silent", ts=old)
-    threshold = now - 30 * 24 * 3600
-    assert len(bot._load_inactive_users(threshold, 10)) == 1
-
-    bot._mark_inactivity_warned(-100, 7, ts=now)
-    assert bot._load_inactive_users(threshold, 10) == []
-
-    bot._touch_user_activity(-100, 7, "Silent", ts=now)
-    assert bot._load_inactive_users(now - 30 * 24 * 3600, 10) == []
-
-
-def test_remind2_requires_prior_warn_and_45_days(activity_db):
-    now = int(time.time())
-    old = now - 50 * 24 * 3600
-    bot._touch_user_activity(-100, 8, "Ghost", ts=old)
-    remind2_threshold = now - 45 * 24 * 3600
-    assert bot._load_inactivity_remind2_candidates(remind2_threshold, 10) == []
-
-    bot._mark_inactivity_warned(-100, 8, ts=now - 10 * 24 * 3600)
-    rows = bot._load_inactivity_remind2_candidates(remind2_threshold, 10)
-    assert len(rows) == 1
-    assert rows[0][1] == 8
-
-    bot._mark_inactivity_remind2(-100, 8, ts=now)
-    assert bot._load_inactivity_remind2_candidates(remind2_threshold, 10) == []
-    assert bot._load_inactivity_remind2(-100, 8) is not None
-
-
-def test_kick_warn_requires_remind2_and_60_days(activity_db):
-    now = int(time.time())
-    old = now - 65 * 24 * 3600
-    bot._touch_user_activity(-100, 20, "LongGone", ts=old)
-    kick_threshold = now - 60 * 24 * 3600
-
-    # not second-reminded yet
-    assert bot._load_inactivity_kick_warn_candidates(kick_threshold, 10) == []
-
-    bot._mark_inactivity_warned(-100, 20, ts=now - 30 * 24 * 3600)
-    bot._mark_inactivity_remind2(-100, 20, ts=now - 15 * 24 * 3600)
-    rows = bot._load_inactivity_kick_warn_candidates(kick_threshold, 10)
-    assert len(rows) == 1
-    assert rows[0][1] == 20
-
-    deadline = now + 3 * 24 * 3600
-    bot._mark_inactivity_kick_warned(-100, 20, warned_at=now, deadline_at=deadline)
-    assert bot._load_inactivity_kick_warn_candidates(kick_threshold, 10) == []
-    assert bot._load_inactivity_kick_due(now, 10) == []
-    assert bot._load_inactivity_kick_due(deadline, 10)[0][1] == 20
-
-
-def test_clear_markers_cancels_kick_deadline(activity_db):
-    now = int(time.time())
-    bot._touch_user_activity(-100, 21, "X", ts=now - 70 * 24 * 3600)
-    bot._mark_inactivity_warned(-100, 21, ts=now - 35 * 24 * 3600)
-    bot._mark_inactivity_remind2(-100, 21, ts=now - 20 * 24 * 3600)
-    bot._mark_inactivity_kick_warned(
-        -100, 21, warned_at=now - 1, deadline_at=now + 100
-    )
-    assert bot._load_inactivity_kick_due(now + 200, 10)
-
-    bot._clear_inactivity_markers(-100, 21, "X", ts=now)
-    assert bot._load_inactivity_remind2(-100, 21) is None
-    assert bot._load_inactivity_kick_due(now + 10**9, 10) == []
-
-
-def test_clear_remind2_restarts_clock(activity_db):
-    now = int(time.time())
-    bot._touch_user_activity(-100, 9, "Muted", ts=now - 50 * 24 * 3600)
-    bot._mark_inactivity_warned(-100, 9, ts=now - 15 * 24 * 3600)
-    bot._mark_inactivity_remind2(-100, 9, ts=now - 1)
-    bot._clear_inactivity_markers(-100, 9, "Muted", ts=now)
-    assert bot._load_inactivity_remind2(-100, 9) is None
-    assert bot._load_inactive_users(now - 30 * 24 * 3600, 10) == []
-
-
-def test_remind2_user_not_in_first_warn_list(activity_db):
-    now = int(time.time())
-    bot._touch_user_activity(-100, 11, "X", ts=now - 60 * 24 * 3600)
-    bot._mark_inactivity_warned(-100, 11, ts=now - 20 * 24 * 3600)
-    bot._mark_inactivity_remind2(-100, 11, ts=now)
-    assert bot._load_inactive_users(now - 30 * 24 * 3600, 10) == []
-
-
-def test_remove_user_activity(activity_db):
-    bot._touch_user_activity(-1, 9, "X", ts=1)
-    bot._remove_user_activity(-1, 9)
-    assert bot._load_inactive_users(10**12, 10) == []
-
-
-def test_message_formats_clickable():
-    mention = bot._html_user_mention(12345, "张三")
-    warn = f"📣 {mention} 你已一个月未发言"
-    remind2 = f"📣 {mention} 你已一个半月未发言"
-    kick_warn = f"⚠️ {mention} 你已经两个月未发言，将在三天后移出群"
-    kick_done = f"👋 {mention} 因长期未发言，已移出群组。"
-    for text in (warn, remind2, kick_warn, kick_done):
-        assert 'href="tg://user?id=12345"' in text
-
-
-def test_schema_has_kick_columns(activity_db):
-    cols = {
-        r[1]
-        for r in sqlite3.connect(activity_db).execute("PRAGMA table_info(user_activity)")
-    }
-    assert {"muted_at", "kick_warned_at", "kick_deadline_at", "last_warned_at"} <= cols
 
 
 def test_user_display_name_helpers():
@@ -187,14 +65,6 @@ def test_soft_ban_allow_all(activity_db):
     assert bot._load_active_ban(-200, 1) is None
     assert bot._load_active_ban(-200, 2) is None
     assert bot._load_active_ban(-201, 3) is not None
-
-
-def test_compat_aliases_exist():
-    assert bot._load_inactivity_mute_candidates is bot._load_inactivity_remind2_candidates
-    assert bot._mark_inactivity_muted is bot._mark_inactivity_remind2
-    assert bot._load_inactivity_mute is bot._load_inactivity_remind2
-    assert bot._clear_inactivity_mute is bot._clear_inactivity_markers
-    assert bot.INACTIVITY_MUTE_DAYS == bot.INACTIVITY_REMIND2_DAYS
 
 
 def test_format_soft_ban_remaining():
@@ -362,3 +232,70 @@ def test_soft_ban_notice_independent_per_user(activity_db):
     bot._save_soft_ban_notice(-200, 1, 300, 1002)
     assert bot._load_soft_ban_notice(-100, 1) == (100, 1000)
     assert bot._load_soft_ban_notice(-200, 1) == (300, 1002)
+
+
+def test_new_database_does_not_create_activity_table(activity_db):
+    with sqlite3.connect(activity_db) as conn:
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='user_activity'"
+        ).fetchall() == []
+
+
+def test_existing_activity_history_is_removed(activity_db):
+    bot._save_ban_record(-100, 42, "User", 0, 0, 0)
+    bot._save_soft_ban_notice(-100, 42, 9001, 1)
+    with sqlite3.connect(activity_db) as conn:
+        conn.execute("CREATE TABLE user_activity (user_id INTEGER, kick_deadline_at INTEGER)")
+        conn.execute("CREATE INDEX idx_user_activity_kick_deadline ON user_activity(kick_deadline_at)")
+        conn.execute("INSERT INTO user_activity VALUES (42, 1)")
+        tables_before = set(conn.execute("SELECT name FROM sqlite_master WHERE type='table'"))
+        protected_rows = {
+            name: conn.execute(f'SELECT * FROM "{name}"').fetchall()
+            for (name,) in tables_before if name != "user_activity"
+        }
+    bot._init_memory_db()
+    bot._init_memory_db()  # Cleanup is safe to repeat on later starts.
+    with sqlite3.connect(activity_db) as conn:
+        tables_after = set(conn.execute("SELECT name FROM sqlite_master WHERE type='table'"))
+        assert tables_after == tables_before - {("user_activity",)}
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE tbl_name='user_activity'"
+        ).fetchall() == []
+        for name, rows in protected_rows.items():
+            assert conn.execute(f'SELECT * FROM "{name}"').fetchall() == rows
+    assert bot._load_active_ban(-100, 42) is not None
+    assert bot._load_soft_ban_notice(-100, 42) == (9001, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [bot.ChatMemberStatus.LEFT, bot.ChatMemberStatus.BANNED])
+async def test_leaving_still_clears_manual_soft_ban(activity_db, monkeypatch, status):
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda _: True)
+    bot._save_ban_record(-100, 42, "User", 0, 0, 0)
+    bot._save_soft_ban_notice(-100, 42, 9001, 1)
+    update = SimpleNamespace(
+        chat_member=SimpleNamespace(new_chat_member=SimpleNamespace(
+            status=status, user=SimpleNamespace(id=42, is_bot=False)
+        )),
+        my_chat_member=None,
+        effective_chat=SimpleNamespace(id=-100, type=bot.ChatType.SUPERGROUP),
+    )
+    await bot.on_chat_member(update, SimpleNamespace())
+    assert bot._load_active_ban(-100, 42) is None
+    assert bot._load_soft_ban_notice(-100, 42) is None
+
+
+@pytest.mark.asyncio
+async def test_joining_does_not_track_activity_or_clear_manual_ban(activity_db, monkeypatch):
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda _: True)
+    bot._save_ban_record(-100, 42, "User", 0, 0, 0)
+    update = SimpleNamespace(
+        chat_member=SimpleNamespace(new_chat_member=SimpleNamespace(
+            status=bot.ChatMemberStatus.MEMBER, user=SimpleNamespace(id=42, is_bot=False)
+        )),
+        my_chat_member=None,
+        effective_chat=SimpleNamespace(id=-100, type=bot.ChatType.SUPERGROUP),
+    )
+    await bot.on_chat_member(update, SimpleNamespace())
+    assert bot._load_active_ban(-100, 42) is not None
+    test_new_database_does_not_create_activity_table(activity_db)

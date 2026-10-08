@@ -162,7 +162,7 @@ async def test_hex_stops_ai_routing_and_quotes_original(application, monkeypatch
     callbacks["on_image_request"].assert_not_awaited()
     callbacks["on_text"].assert_not_awaited()
     callbacks["enforce_soft_ban"].assert_awaited_once()
-    callbacks["track_activity"].assert_awaited_once()
+    assert "track_activity" not in callbacks
 
 
 @pytest.mark.asyncio
@@ -171,3 +171,34 @@ async def test_soft_ban_stops_hex_reply(application):
     callbacks["enforce_soft_ban"].side_effect = bot.ApplicationHandlerStop
     await app.process_update(make_update(app, "message", "#abcdef"))
     callbacks["on_hex_color"].assert_not_awaited()
+
+
+def test_inactivity_message_tracking_is_not_registered(application):
+    _, callbacks = application
+    assert "track_activity" not in callbacks
+
+
+@pytest.mark.asyncio
+async def test_startup_has_no_inactivity_job(application, monkeypatch):
+    app, _ = application
+    tasks = []
+    monkeypatch.setattr(type(app.bot), "get_me", AsyncMock(return_value=app.bot._bot_user))
+    monkeypatch.setattr(type(app.bot), "set_my_commands", AsyncMock())
+
+    def capture_task(self, coro):
+        tasks.append(coro.cr_code.co_name)
+        coro.close()
+
+    monkeypatch.setattr(Application, "create_task", capture_task)
+    await bot.post_init(app)
+    assert tasks == [
+        "_managed_pin_scheduler_loop",
+        "_codex_reset_scheduler_loop",
+        "_ban_release_scheduler_loop",
+    ]
+
+
+def test_inactivity_config_and_kick_implementation_are_removed():
+    assert not any(name.startswith("INACTIVITY_") for name in vars(bot))
+    assert not hasattr(bot, "_ban_chat_member_kick")
+    assert not hasattr(bot, "_check_and_kick_due")
