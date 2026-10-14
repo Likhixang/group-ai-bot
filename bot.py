@@ -4079,7 +4079,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"/vid 或 vid 描述 — 生成视频 ({VIDEO_MODEL}，约 {VIDEO_DURATION} 秒)\n"
             "  回复图片或上传图片写 /vid 描述 — 图生视频\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
-            "/ip IP地址 — 查 IP 纯净度评分（多源聚合）\n"
+            "/ip IP地址 — 查 IP 纯净度评分（Net.Coffee）\n"
             "/dc — 查询 Telegram 账号所在 DC（回复他人消息可查对方）\n"
             "/whois 域名 — 查域名 WHOIS 信息（注册商/时间/NS/状态）\n"
             "/ping 域名 — 从全球节点测延迟（支持指定 DNS/地区）\n"
