@@ -111,8 +111,17 @@ def check_ip(ip: str) -> dict:
         "location": {},
         "isp": "",
         "asn": "",
+        "asn_num": None,
+        "asn_org": "",
+        "asn_tbps": "",
+        "asn_ipv4_count": None,
         "cidr": "",
         "rdns": "",
+        "rpki_status": "",
+        "reddit_blocked": False,
+        "public_service": None,
+        "intelligence": {},
+        "related_domains": [],
         "tags": [],
         "ai_verdict": None,
         "error": None,
@@ -165,14 +174,36 @@ def check_ip(ip: str) -> dict:
     result["isp"] = isp
     result["cidr"] = data.get("cidr", "") or ""
     result["rdns"] = data.get("rdns", "") or ""
+    result["rpki_status"] = data.get("rpki_status", "") or ""
+    result["reddit_blocked"] = bool(data.get("reddit_blocked", False))
 
-    # ASN
+    # ASN 详情
     asn_num = data.get("asn")
     as_org = data.get("asOrganization", "") or data.get("asname", "") or ""
+    result["asn_num"] = asn_num
+    result["asn_org"] = as_org
+    result["asn_tbps"] = data.get("asn_tbps", "") or ""
+    result["asn_ipv4_count"] = data.get("asn_ipv4_count")
     if asn_num:
         result["asn"] = f"AS{asn_num} {as_org}".strip()
     elif as_org:
         result["asn"] = as_org
+
+    # 公共服务
+    if data.get("is_public_service") and isinstance(data.get("public_service"), dict):
+        result["public_service"] = data["public_service"]
+
+    # 威胁与情报
+    intel = data.get("intelligence")
+    if isinstance(intel, dict):
+        result["intelligence"] = intel
+
+    # 关联域名（取前 5 个）
+    rel = data.get("related_domains")
+    if isinstance(rel, list):
+        result["related_domains"] = [
+            d.get("domain") for d in rel if isinstance(d, dict) and d.get("domain")
+        ][:5]
 
     # AI / 场景分析
     ai_verdict = data.get("ai_verdict")
@@ -244,14 +275,46 @@ def format_report(result: dict) -> str:
 
     asn = result.get("asn", "")
     if asn and _is_valid_asn(asn):
-        lines.append(f"🔗 <b>ASN:</b> {esc(asn)}")
+        asn_str = esc(asn)
+        asn_extra = []
+        if result.get("asn_tbps"):
+            asn_extra.append(esc(result["asn_tbps"]))
+        if result.get("asn_ipv4_count"):
+            cnt = result["asn_ipv4_count"]
+            if cnt >= 10000:
+                cnt_str = f"{cnt // 10000}万 IP"
+            else:
+                cnt_str = f"{cnt} IP"
+            asn_extra.append(cnt_str)
+        if asn_extra:
+            asn_str += f" ({' · '.join(asn_extra)})"
+        lines.append(f"🔗 <b>ASN:</b> {asn_str}")
     elif asn:
         lines.append(f"🔗 <b>ASN:</b> {esc(asn)}")
     else:
         lines.append("🔗 <b>ASN:</b> 未知")
 
+    # CIDR & RPKI 状态
+    cidr_parts = []
+    if result.get("cidr"):
+        cidr_parts.append(esc(result["cidr"]))
+    if result.get("rpki_status"):
+        rpki_map = {"valid": "RPKI 有效", "invalid": "RPKI 无效", "not_found": "RPKI 未宣告"}
+        rpki_text = rpki_map.get(result["rpki_status"].lower(), f"RPKI {result['rpki_status']}")
+        cidr_parts.append(rpki_text)
+    if cidr_parts:
+        lines.append(f"🛣 <b>路由:</b> {' · '.join(cidr_parts)}")
+
     if result.get("rdns"):
         lines.append(f"🌐 <b>rDNS:</b> {esc(result['rdns'])}")
+
+    # 公共服务
+    pub = result.get("public_service")
+    if pub and isinstance(pub, dict) and pub.get("service"):
+        pub_desc = esc(pub["service"])
+        if pub.get("note"):
+            pub_desc += f" ({esc(pub['note'])})"
+        lines.append(f"🏛 <b>公共服务:</b> {pub_desc}")
 
     if tags:
         lines += ["", f"🏷 <b>标记:</b> {' · '.join(esc(t) for t in tags)}"]
@@ -275,9 +338,33 @@ def format_report(result: dict) -> str:
             val = "是" if is_flagged else "否"
         lines.append(f"{icon} {name}: {val}")
 
+    # 社区与威胁情报
+    intel = result.get("intelligence") or {}
+    threat_labels = []
+    if isinstance(intel.get("threats"), list):
+        for th in intel["threats"]:
+            if isinstance(th, dict) and th.get("label"):
+                threat_labels.append(th["label"])
+
+    intel_items = []
+    if intel.get("abuser_score_raw"):
+        intel_items.append(f"滥用等级: {esc(intel['abuser_score_raw'])}")
+    if threat_labels:
+        intel_items.append(f"命中威胁: {esc(' · '.join(threat_labels))}")
+    if result.get("reddit_blocked"):
+        intel_items.append("Reddit: 已封禁")
+
+    if intel_items:
+        lines += ["", f"🚨 <b>威胁情报:</b> {' | '.join(intel_items)}"]
+
     ai_v = result.get("ai_verdict")
     if ai_v and isinstance(ai_v, dict) and ai_v.get("reasoning"):
         lines += ["", f"💡 <b>评估说明:</b> {esc(ai_v['reasoning'])}"]
+
+    # 关联域名
+    rel_domains = result.get("related_domains") or []
+    if rel_domains:
+        lines += ["", f"📑 <b>解析域名:</b> <code>{'</code>, <code>'.join(esc(d) for d in rel_domains[:3])}</code>"]
 
     lines += [
         "",
