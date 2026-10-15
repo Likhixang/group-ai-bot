@@ -21,9 +21,6 @@ Edit `.env` and fill in:
 - (optional) `OAI_MODEL`
 - (optional) `IMAGE_MODEL` — 图片生成模型名（默认 gpt-image-2）
 - (optional) `IMAGE_EDIT_MODEL` — 图生图模型名（默认同 IMAGE_MODEL）
-- `GROK_API_BASE_URL` — `/gkimg` and `/vid` API base URL
-- `GROK_API_KEY` — dedicated API key for `/gkimg` and `/vid`
-- (optional) `GROK_IMAGE_MODEL` — `/gkimg` 图片生成模型名（默认 grok-imagine-image-2.0）
 - (optional) `IMAGE_ASPECT_RATIO` — 画幅: 1:1 / 3:4 / 4:3 / 9:16 / 16:9
 
 - (optional) `MEMORY_MAX_TURNS`
@@ -61,12 +58,8 @@ docker compose logs -f group-ai-bot
 ## 3. Usage in Groups
 
 - Send a standalone HEX color (`#RGB`, `#RRGGBB`, or `RRGGBB`, case-insensitive) to get a 52×52 color swatch generated as PNG, without calling AI. The input and swatch are deleted after the global cleanup TTL (currently 30 seconds). Existing chat/topic permissions apply; normal text and edited messages do not trigger it.
-- `grok your question` (fast text model: `grok-4-1-fast`)
-- `grokt your question` (deep-thinking text: `grok-4-1-thinking`)
 - `oai your question` or `/oai your question` (GPT model: `gpt-5.5`)
 - `img your prompt` or `/img your prompt` — generate an image with `gpt-image-2`
-- `/gkimg your prompt` — generate an image with `grok-imagine-image-2.0`
-- `/vid your prompt` — generate a video with `grok-imagine-video-1.5`
 - Reply to a bot-generated text message to continue the text context (no prefix needed)
 - Reply to a bot-generated image with edit instructions to modify that image
 - `edit your instructions` or `/edit your instructions` — edit the replied image; also works when uploading a photo with the edit instruction as caption
@@ -95,4 +88,3 @@ docker compose logs -f group-ai-bot
 ## 5. Security
 
 - Do not commit `.env` to git.
-- Keep `AI_API_KEY`, `GROK_API_KEY`, and `TELEGRAM_BOT_TOKEN` only in environment variables.

@@ -64,17 +64,11 @@ DS_MODEL = (
 ).strip()
 AI_THINKING_MODEL = os.getenv("AI_THINKING_MODEL", "ds-4.1-thinking").strip()
 OAI_MODEL = os.getenv("OAI_MODEL", "gpt-5.5").strip()
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-6-luna").strip()
 LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
-GROK_IMAGE_MODEL = os.getenv("GROK_IMAGE_MODEL", "grok-imagine-image-2.0").strip()
-GROK_API_BASE_URL = os.getenv(
-    "GROK_API_BASE_URL", "https://api.215102.xyz/v1"
-).strip().rstrip("/")
-GROK_API_KEY = os.getenv("GROK_API_KEY", "").strip()
 # --- 图片生成 (AxonHub /v1/images/generations，OpenAI 兼容) ---
 # 文生图：POST {AI_BASE_URL}/images/generations
 # 图生图：同端点，附 image 字段（base64）
@@ -221,13 +215,6 @@ JAVDATABASE_USER_AGENT = FOURHOI_USER_AGENT
 AV_ACTOR_ROMJI_SAMPLE = 20
 AV_ACTOR_TOP_LIMIT = max(1, min(10, int(os.getenv("AV_ACTOR_TOP_LIMIT", "10"))))
 
-# --- Grok 视频生成（独立 Sub2API 异步任务 API）---
-VIDEO_MODEL = os.getenv("VIDEO_MODEL", "grok-imagine-video-1.5").strip()
-VIDEO_DURATION = max(1, min(15, int(os.getenv("VIDEO_DURATION", "8"))))
-VIDEO_ASPECT_RATIO = os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip()
-VIDEO_RESOLUTION = os.getenv("VIDEO_RESOLUTION", "720p").strip()
-VIDEO_POLL_INTERVAL = int(os.getenv("VIDEO_POLL_INTERVAL", "6"))
-VIDEO_POLL_TIMEOUT = int(os.getenv("VIDEO_POLL_TIMEOUT", "600"))
 WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
 WEB_FETCH_MAX_RESULTS = int(os.getenv("WEB_FETCH_MAX_RESULTS", "3"))
 WEB_FETCH_MAX_CHARS = int(os.getenv("WEB_FETCH_MAX_CHARS", "1800"))
@@ -896,11 +883,7 @@ def _image_request_command(raw_text: str) -> str:
 
 
 def _is_image_generation_request(raw_text: str) -> bool:
-    return _image_request_command(raw_text) in {"img", "gkimg"}
-
-
-def _is_grok_image_generation_request(raw_text: str) -> bool:
-    return _image_request_command(raw_text) == "gkimg"
+    return _image_request_command(raw_text) == "img"
 
 
 def _is_image_edit_request(raw_text: str) -> bool:
@@ -910,7 +893,7 @@ def _is_image_edit_request(raw_text: str) -> bool:
 
 def _clean_image_prompt(raw_text: str) -> str:
     text = (raw_text or "").strip()
-    if _image_request_command(text) in {"img", "gkimg", "edit"}:
+    if _image_request_command(text) in {"img", "edit"}:
         return text.partition(" ")[2].strip()
     return text.strip()
 
@@ -989,15 +972,13 @@ def _is_text_ai_prefix(raw_text: str) -> bool:
     return (
         text.startswith("ds ")
         or text.startswith("/ds ")
-        or text.startswith("gk ")
-        or text.startswith("/gk ")
         or text.startswith("gm ")
         or text.startswith("/gm ")
         or text.startswith("ln ")
         or text.startswith("/ln ")
         or text.startswith("lm ")
         or text.startswith("/lm ")
-        or text in {"ds", "/ds", "gk", "/gk", "gm", "/gm", "ln", "/ln", "lm", "/lm"}
+        or text in {"ds", "/ds", "gm", "/gm", "ln", "/ln", "lm", "/lm"}
     )
 
 
@@ -1050,12 +1031,12 @@ def _is_reply_to_this_bot(msg) -> bool:
 def _clean_prompt(raw_text: str) -> str:
     text = raw_text.strip()
     low = text.lower()
-    for prefix in ("/gk ", "gk ", "/ds ", "ds ", "/gm ", "gm ", "/ln ", "ln ", "/lm ", "lm "):
+    for prefix in ("/ds ", "ds ", "/gm ", "gm ", "/ln ", "ln ", "/lm ", "lm "):
         if low.startswith(prefix):
             text = text[len(prefix):].strip()
             break
     else:
-        if low in {"/gk", "gk", "/ds", "ds", "/gm", "gm", "/ln", "ln", "/lm", "lm"}:
+        if low in {"/ds", "ds", "/gm", "gm", "/ln", "ln", "/lm", "lm"}:
             text = ""
     # Strip leading @bot_username mention
     if BOT_USERNAME:
@@ -1091,7 +1072,7 @@ def _inherit_text_model_from_reply(msg) -> Optional[str]:
     if not model_name:
         logger.info("model_inherit: no model line found in replied text")
         return None
-    if model_name in {DS_MODEL, AI_THINKING_MODEL, OAI_MODEL, GROK_MODEL, GEMINI_MODEL, LUNA_MODEL, LUMO_MODEL}:
+    if model_name in {DS_MODEL, AI_THINKING_MODEL, OAI_MODEL, GEMINI_MODEL, LUNA_MODEL, LUMO_MODEL}:
         logger.info("model_inherit: inherited model=%s", model_name)
         return model_name
     logger.info("model_inherit: model line found but not allowed model=%s", model_name)
@@ -1100,8 +1081,6 @@ def _inherit_text_model_from_reply(msg) -> Optional[str]:
 
 def _select_text_model(raw_text: str, msg=None) -> str:
     low = (raw_text or "").strip().lower()
-    if low.startswith("/gk ") or low.startswith("gk ") or low in {"/gk", "gk"}:
-        return GROK_MODEL
     if low.startswith("/gm ") or low.startswith("gm ") or low in {"/gm", "gm"}:
         return GEMINI_MODEL
     if low.startswith("/ln ") or low.startswith("ln ") or low in {"/ln", "ln"}:
@@ -2812,62 +2791,6 @@ async def _generate_image(prompt: str, model: str = IMAGE_MODEL) -> bytes:
             raise
 
 
-async def _generate_grok_image(prompt: str) -> bytes:
-    """Generate an image through the dedicated Grok Sub2API endpoint."""
-    if not GROK_API_KEY:
-        raise RuntimeError("GROK_API_KEY is not configured")
-    headers = {"Authorization": f"Bearer {GROK_API_KEY}"}
-    payload = {
-        "model": GROK_IMAGE_MODEL,
-        "prompt": prompt,
-        "n": 1,
-        "size": "1024x1024",
-    }
-    for attempt in range(IMAGE_GEN_RETRIES + 1):
-        try:
-            async with httpx.AsyncClient(
-                timeout=IMAGE_GEN_TIMEOUT, follow_redirects=True
-            ) as client:
-                resp = await client.post(
-                    f"{GROK_API_BASE_URL}/images/generations",
-                    headers=headers,
-                    json=payload,
-                )
-                if resp.status_code >= 400:
-                    raise RuntimeError(
-                        f"Grok image HTTP {resp.status_code}: {resp.text[:500]}"
-                    )
-                data = resp.json().get("data") or []
-                if not data:
-                    raise RuntimeError("Grok image response contains no data")
-                first = data[0] or {}
-                if first.get("b64_json"):
-                    return base64.b64decode(first["b64_json"])
-                image_url = first.get("url")
-                if not image_url:
-                    raise RuntimeError("Grok image response contains no image URL")
-                image_resp = await client.get(image_url)
-                if image_resp.status_code >= 400:
-                    raise RuntimeError(
-                        f"Grok image download HTTP {image_resp.status_code}"
-                    )
-                if not image_resp.content:
-                    raise RuntimeError("Grok image download returned empty content")
-                return image_resp.content
-        except Exception as exc:
-            if attempt < IMAGE_GEN_RETRIES:
-                logger.warning(
-                    "grok image attempt %s/%s failed (%s), retrying in %ss...",
-                    attempt + 1,
-                    IMAGE_GEN_RETRIES + 1,
-                    exc,
-                    IMAGE_GEN_RETRY_DELAY * (attempt + 1),
-                )
-                await asyncio.sleep(IMAGE_GEN_RETRY_DELAY * (attempt + 1))
-                continue
-            raise
-
-
 # 图像编辑引导语：标准 OpenAI /images/edits 接口，multipart/form-data 上传原图。
 # 配合提示词强调保留原图构图与主体，只按用户要求做局部改动。
 IMAGE_EDIT_GUIDE = (
@@ -3043,136 +2966,6 @@ async def _generate_image_with_reference(
         model=model,
         log_tag="image reference",
     )
-
-
-def _split_video_prefix(raw_text: str) -> Optional[str]:
-    """若文本以 vid 前缀开头，返回去掉前缀后的提示词，否则返回 None。
-
-    兼容群里 /vid@BotName 的写法 —— Telegram 在群中会把命令补成
-    /vid@BotName，只匹配 "/vid " 会漏掉。
-    """
-    text = (raw_text or "").strip()
-    if not text:
-        return None
-    head, _, rest = text.partition(" ")
-    head = head.lower().split("@")[0]
-    if head in {"/vid", "vid"}:
-        return rest.strip()
-    return None
-
-
-def _is_video_request(raw_text: str) -> bool:
-    return _split_video_prefix(raw_text) is not None
-
-
-def _clean_video_prompt(raw_text: str) -> str:
-    stripped = _split_video_prefix(raw_text)
-    if stripped is not None:
-        return stripped
-    return (raw_text or "").strip()
-
-
-def _video_source_image(msg) -> Optional[str]:
-    """取图生视频的输入图 file_id。
-
-    与 _reply_image_target 不同：不要求被回复的消息属于 bot 自己 ——
-    图生视频允许拿群里任何人发的图当首帧。
-    """
-    if not msg:
-        return None
-    own = _message_image_target(msg)
-    if own:
-        return own
-    return _message_image_target(getattr(msg, "reply_to_message", None))
-
-
-async def _create_video_task(
-    prompt: str,
-    image_url: Optional[str] = None,
-    image_bytes: Optional[bytes] = None,
-) -> str:
-    """通过独立 Grok Sub2API 提交视频任务，返回 request_id。"""
-    if not GROK_API_KEY:
-        raise RuntimeError("GROK_API_KEY is not configured")
-    headers = {
-        "Authorization": f"Bearer {GROK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": VIDEO_MODEL,
-        "prompt": prompt,
-        "duration": VIDEO_DURATION,
-        "aspect_ratio": VIDEO_ASPECT_RATIO,
-        "resolution": VIDEO_RESOLUTION,
-    }
-    if image_bytes:
-        mime = "image/png" if image_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
-        payload["image"] = {
-            "url": f"data:{mime};base64," + base64.b64encode(image_bytes).decode()
-        }
-    elif image_url:
-        payload["image"] = {"url": image_url}
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            f"{GROK_API_BASE_URL}/videos/generations",
-            headers=headers,
-            json=payload,
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Video create HTTP {resp.status_code}: {resp.text[:500]}")
-        data = resp.json()
-    vid = data.get("request_id") or data.get("video_id") or data.get("task_id") or data.get("id")
-    if not vid:
-        raise RuntimeError(f"Video create: no id in response {str(data)[:300]}")
-    return vid
-
-
-async def _poll_video_result(video_id: str, on_progress=None) -> str:
-    """轮询 Grok Sub2API 任务直到完成，返回受鉴权保护的内容 URL。"""
-    headers = {"Authorization": f"Bearer {GROK_API_KEY}"}
-    task_id = urllib.parse.quote(video_id, safe="")
-    url = f"{GROK_API_BASE_URL}/videos/generations/{task_id}"
-    deadline = time.time() + VIDEO_POLL_TIMEOUT
-    last_progress = -1
-    async with httpx.AsyncClient(timeout=60) as client:
-        while time.time() < deadline:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"Video poll HTTP {resp.status_code}: {resp.text[:300]}")
-            data = resp.json()
-            status = (data.get("status") or "").lower()
-            progress = data.get("progress") or 0
-            if status in {"done", "completed", "succeeded", "success"}:
-                return f"{GROK_API_BASE_URL}/videos/generations/{task_id}/content"
-            if status in {"failed", "error", "cancelled", "expired"}:
-                err = data.get("error") or status
-                raise RuntimeError(f"Video generation failed: {str(err)[:300]}")
-            if on_progress and progress != last_progress:
-                last_progress = progress
-                try:
-                    await on_progress(progress)
-                except Exception:
-                    pass
-            await asyncio.sleep(VIDEO_POLL_INTERVAL)
-    raise RuntimeError(f"Video generation timed out after {VIDEO_POLL_TIMEOUT}s")
-
-
-async def _download_video(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
-        resp = await client.get(
-            url, headers={"Authorization": f"Bearer {GROK_API_KEY}"}
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Video download HTTP {resp.status_code}")
-        return resp.content
-
-
-def _video_failure_message(exc: Exception) -> str:
-    """Return a useful Telegram error without exposing provider internals."""
-    detail = str(exc).lower()
-    if "content_policy_violation" in detail or "内容审计" in detail:
-        return "视频生成被上游内容审计拒绝，请调整提示词或图片后重试。"
-    return "视频生成失败，请稍后再试。"
 
 
 async def _download_telegram_file(
@@ -4047,7 +3840,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
     await _reply_text_and_track(
         msg,
-        "已上线。发送：ds / gk / gm + 空格 + 问题；img + 提示词生成图片；gkimg + 提示词用 Grok 生成图片；回复图片用 edit + 要求改图；/av 番号查封面，回复图片发 /av 或图片 caption 写 /av 可检索番号。"
+        "已上线。发送：ds / gm + 空格 + 问题；img + 提示词生成图片；回复图片用 edit + 要求改图；/av 番号查封面，回复图片发 /av 或图片 caption 写 /av 可检索番号。"
     )
 
 
@@ -4068,16 +3861,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             msg,
             "用法:\n"
             f"/ds 或 ds 你的问题 — 对话 ({DS_MODEL})\n"
-            f"/gk 或 gk 你的问题 — 对话 ({GROK_MODEL})\n"
             f"/gm 或 gm 你的问题 — 对话 ({GEMINI_MODEL})\n"
             f"/lm 或 lm 你的问题 — 对话 ({LUMO_MODEL})\n"
             f"/ln 或 ln 你的问题 — 对话 ({LUNA_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
-            f"/gkimg 提示词 — 生成图片 ({GROK_IMAGE_MODEL})\n"
             "/edit 或 edit 要求 — 回复图片改图（或上传图+写 caption）\n"
             "/av 番号 — 查询封面（Fourhoi → R18.dev）；回复图片发 /av，或图片 caption 写 /av 检索番号（AVScan）\n"
-            f"/vid 或 vid 描述 — 生成视频 ({VIDEO_MODEL}，约 {VIDEO_DURATION} 秒)\n"
-            "  回复图片或上传图片写 /vid 描述 — 图生视频\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
             "/ip IP地址 — 查 IP 纯净度评分（Net.Coffee）\n"
             "/dc — 查询 Telegram 账号所在 DC（回复他人消息可查对方）\n"
@@ -4814,7 +4603,7 @@ def _message_prompt_text(msg) -> str:
 
 
 async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /ds, /gk, /gm and /lm commands by forwarding to on_text with prefix restored."""
+    """Handle /ds, /gm, /ln and /lm commands by forwarding to on_text with prefix restored."""
     msg = update.effective_message
     if not msg:
         return
@@ -5209,18 +4998,12 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if _is_avscan_request(_message_prompt_text(msg)):
         await av_cmd(update, context)
         return
-    # /vid 分流：PTB 的 CommandHandler 只认 message.text，图片 caption 里的
-    # /vid 不会触发 video_cmd，所以在这里接住转过去。
-    if _is_video_request(_message_prompt_text(msg)):
-        await video_cmd(update, context)
-        return
     if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}:
         if not _is_private_super_admin(chat, msg.from_user.id if msg.from_user else None):
             return
     override_text = context.user_data.pop("_image_prefix_text", None) if context.user_data is not None else None
     raw_text = override_text or _message_prompt_text(msg)
     is_generation = _is_image_generation_request(raw_text)
-    is_grok_generation = _is_grok_image_generation_request(raw_text)
     is_edit = _is_image_edit_request(raw_text)
     reply_image_file_id = _reply_image_target(msg)
     if is_edit and not reply_image_file_id:
@@ -5236,17 +5019,15 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
     if not (is_generation or is_edit or reply_image_file_id or (own_image_file_id and is_edit)):
-        # Forward ds/gk + photo to text conversation
+        # Forward text AI prefixes + photo to text conversation
         raw_lower = raw_text.strip().lower()
         if (
             (
                 raw_lower.startswith("ds ")
-                or raw_lower.startswith("gk ")
                 or raw_lower.startswith("gm ")
                 or raw_lower.startswith("lm ")
                 or raw_lower.startswith("ln ")
                 or raw_lower.startswith("/ds ")
-                or raw_lower.startswith("/gk ")
                 or raw_lower.startswith("/gm ")
                 or raw_lower.startswith("/lm ")
                 or raw_lower.startswith("/ln ")
@@ -5264,7 +5045,6 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     image_prompt = prompt
-    generation_model = GROK_IMAGE_MODEL if is_grok_generation else IMAGE_MODEL
 
     edit_file_id = None
     if is_edit:
@@ -5283,13 +5063,6 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             final_prompt = await _expand_image_edit_prompt(image_prompt)
             image_bytes = await _edit_image(final_prompt, source_bytes)
             model_name = IMAGE_EDIT_MODEL
-        elif is_grok_generation:
-            # /gkimg has its own provider and does not reuse /img's reference
-            # search/edit path. Send the user's prompt verbatim because xAI
-            # can reject some Luna-expanded prompts with HTTP 400.
-            final_prompt = image_prompt
-            image_bytes = await _generate_grok_image(final_prompt)
-            model_name = GROK_IMAGE_MODEL
         else:
             # 提示词扩写与参考图并行准备；参考图缺失时回退纯文本生成。
             final_prompt, reference_bytes = await asyncio.gather(
@@ -5303,11 +5076,11 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     len(reference_bytes),
                 )
                 image_bytes = await _generate_image_with_reference(
-                    final_prompt, reference_bytes, model=generation_model
+                    final_prompt, reference_bytes, model=IMAGE_MODEL
                 )
             else:
-                image_bytes = await _generate_image(final_prompt, model=generation_model)
-            model_name = generation_model
+                image_bytes = await _generate_image(final_prompt, model=IMAGE_MODEL)
+            model_name = IMAGE_MODEL
         caption = (
             f"<blockquote>模型: {escape(model_name)}</blockquote>\n"
             f"<blockquote>提示词: {escape(final_prompt[:850])}</blockquote>"
@@ -5341,91 +5114,6 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await _reply_text_and_track(msg, "图片服务暂时不可用，请稍后再试。")
 
 
-async def video_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """生成视频。用法：/vid <描述>"""
-    msg = update.effective_message
-    chat = update.effective_chat
-    if not msg or not chat:
-        return
-
-    if not GROK_API_KEY:
-        await _reply_text_and_track(msg, "Grok 媒体服务没配置好（缺 GROK_API_KEY）。")
-        return
-
-    uid = msg.from_user.id if msg.from_user else None
-    if not _is_private_super_admin(chat, uid):
-        if not _is_allowed_chat(chat) or not _is_allowed_topic(msg):
-            await _reply_not_allowed_and_cleanup(msg, context)
-            return
-
-
-    override_text = context.user_data.pop("_video_prefix_text", None) if context.user_data is not None else None
-    prompt = _clean_video_prompt(override_text or _message_prompt_text(msg))
-    if not prompt:
-        await _reply_text_and_track(
-            msg,
-            "用法:\n"
-            "`/vid <描述>` — 文生视频\n"
-            "回复一张图片写 `/vid <描述>`，或上传图片 caption 写 `/vid <描述>` — 图生视频",
-        )
-        return
-
-    source_file_id = _video_source_image(msg)
-
-    seconds = VIDEO_DURATION
-    mode_label = "图生视频" if source_file_id else "生成视频"
-    status = await _reply_text_and_track(
-        msg, f"{mode_label}中... 约 {seconds:.1f} 秒时长，通常要等 1-2 分钟。"
-    )
-
-    async def on_progress(progress: int) -> None:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=status.chat_id,
-                message_id=status.message_id,
-                text=f"生成视频中... {progress}%",
-            )
-        except Exception:
-            pass
-
-    try:
-        source_bytes = None
-        if source_file_id:
-            source_bytes = await _download_telegram_file(context, source_file_id)
-        video_id = await _create_video_task(prompt, image_bytes=source_bytes)
-        logger.info(
-            "video_task_created: chat=%s id=%s mode=%s prompt=%r",
-            chat.id, video_id, "i2v" if source_bytes else "t2v", prompt[:120],
-        )
-        video_url = await _poll_video_result(video_id, on_progress=on_progress)
-        video_bytes = await _download_video(video_url)
-
-        buf = BytesIO(video_bytes)
-        buf.name = "video.mp4"
-        mode_tag = " (图生视频)" if source_bytes else ""
-        caption = f"模型: {VIDEO_MODEL}{mode_tag}\n提示词: {prompt[:850]}"
-        await msg.reply_video(video=buf, caption=caption, supports_streaming=True)
-        try:
-            await context.bot.delete_message(chat_id=status.chat_id, message_id=status.message_id)
-        except Exception:
-            pass
-        logger.info(
-            "video_response_complete: chat=%s msg=%s id=%s bytes=%s",
-            chat.id, msg.message_id, video_id, len(video_bytes),
-        )
-    except Exception as exc:
-        logger.exception("video request failed")
-        failure_text = _video_failure_message(exc)
-        try:
-            await context.bot.edit_message_text(
-                chat_id=status.chat_id,
-                message_id=status.message_id,
-                text=failure_text,
-            )
-        except Exception:
-            await _reply_text_and_track(msg, failure_text)
-
-
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     chat = update.effective_chat
@@ -5436,7 +5124,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _is_private_super_admin(chat, msg.from_user.id if msg.from_user else None):
             return
 
-    # ai_cmd sets this override when handling /ds or /gk
+    # ai_cmd sets this override when handling text AI commands
     _ds_override = context.user_data.pop("_ds_prefix_text", None)
     _msg_text = _ds_override if _ds_override else (msg.text or "")
 
@@ -7106,15 +6794,12 @@ async def post_init(application: Application) -> None:
     BOT_ID = me.id
     commands = [
         BotCommand("ds", f"对话 ({DS_MODEL})"),
-        BotCommand("gk", f"对话 ({GROK_MODEL})"),
         BotCommand("gm", f"对话 ({GEMINI_MODEL})"),
         BotCommand("lm", f"对话 ({LUMO_MODEL})"),
         BotCommand("ln", f"对话 ({LUNA_MODEL})"),
         BotCommand("img", "生成图片"),
-        BotCommand("gkimg", f"生成图片 ({GROK_IMAGE_MODEL})"),
         BotCommand("edit", "修改图片"),
         BotCommand("av", "番号查 R18.dev 封面；图片检索 AVScan"),
-        BotCommand("vid", "生成视频"),
         BotCommand("help", "查看帮助"),
         BotCommand("new", "清空你在当前聊天的记忆"),
         BotCommand("clear", "删除你与 AI 的对话消息"),
@@ -7194,12 +6879,11 @@ def main() -> None:
     app.add_handler(CommandHandler("force_stop", force_stop_cmd))
     app.add_handler(CommandHandler("pin", pin_cmd))
     app.add_handler(CommandHandler("unpin", unpin_cmd))
-    app.add_handler(CommandHandler(["img", "gkimg", "edit"], image_cmd))
+    app.add_handler(CommandHandler(["img", "edit"], image_cmd))
     app.add_handler(CommandHandler("av", av_cmd))
-    app.add_handler(CommandHandler("vid", video_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("allow", allow_cmd))
-    app.add_handler(CommandHandler(["ds", "gk", "gm", "lm", "ln"], ai_cmd))
+    app.add_handler(CommandHandler(["ds", "gm", "lm", "ln"], ai_cmd))
     app.add_handler(CommandHandler("ip", ip_cmd))
     app.add_handler(CommandHandler("dc", dc_cmd))
     app.add_handler(CommandHandler("whois", whois_cmd))

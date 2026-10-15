@@ -9,14 +9,10 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 os.environ.setdefault("AI_API_KEY", "test-key")
 os.environ.setdefault("AI_BASE_URL", "http://127.0.0.1:8090/v1")
 os.environ.setdefault("DS_MODEL", "deepseek-v4-flash")
-os.environ.setdefault("GROK_MODEL", "grok-4.6")
 os.environ.setdefault("AI_THINKING_MODEL", "deepseek-v4-pro")
 os.environ.setdefault("OAI_MODEL", "gpt-5.5")
 os.environ.setdefault("IMAGE_MODEL", "gpt-image-2")
 os.environ.setdefault("IMAGE_EDIT_MODEL", "gpt-image-2")
-os.environ.setdefault("GROK_IMAGE_MODEL", "grok-imagine-image-2.0")
-os.environ.setdefault("GROK_API_BASE_URL", "https://grok.example/v1")
-os.environ.setdefault("GROK_API_KEY", "test-grok-key")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 bot = importlib.import_module("bot")
@@ -25,22 +21,15 @@ bot = importlib.import_module("bot")
 def test_clean_image_prompt_removes_img_and_edit_prefixes():
     assert bot._clean_image_prompt("img 画一只猫") == "画一只猫"
     assert bot._clean_image_prompt("/img 画一只猫") == "画一只猫"
-    assert bot._clean_image_prompt("/gkimg 画一只猫") == "画一只猫"
     assert bot._clean_image_prompt("edit 改成夜景") == "改成夜景"
     assert bot._clean_image_prompt("/edit 改成夜景") == "改成夜景"
 
 
-def test_clean_prompt_and_select_text_model_for_ds_and_gk():
+def test_clean_prompt_and_select_text_model_for_ds():
     assert bot._clean_prompt("ds 你好") == "你好"
     assert bot._clean_prompt("/ds 你好") == "你好"
-    assert bot._clean_prompt("gk 你好") == "你好"
-    assert bot._clean_prompt("/gk 你好") == "你好"
     assert bot._select_text_model("ds 你好") == bot.DS_MODEL
     assert bot._select_text_model("/ds 你好") == bot.DS_MODEL
-    assert bot._select_text_model("gk 你好") == bot.GROK_MODEL
-    assert bot._select_text_model("/gk 你好") == bot.GROK_MODEL
-    assert bot._is_text_ai_prefix("gk 测试") is True
-    assert bot._is_text_ai_prefix("/gk 测试") is True
 
 
 def test_clean_prompt_and_select_text_model_for_gm():
@@ -80,9 +69,6 @@ def test_clean_prompt_and_select_text_model_for_lm():
 def test_image_request_detection_handles_prefixes_and_commands():
     assert bot._is_image_generation_request("img 赛博朋克城市") is True
     assert bot._is_image_generation_request("/img 赛博朋克城市") is True
-    assert bot._is_image_generation_request("/gkimg 赛博朋克城市") is True
-    assert bot._is_image_generation_request("/gkimg@any_bot 赛博朋克城市") is True
-    assert bot._is_grok_image_generation_request("/gkimg 赛博朋克城市") is True
     assert bot._is_image_generation_request("ds img 赛博朋克城市") is False
     assert bot._is_image_edit_request("edit 改成水彩") is True
     assert bot._is_image_edit_request("/edit 改成水彩") is True
@@ -583,215 +569,6 @@ def test_generate_image_uses_requested_model(monkeypatch):
         "n": 1,
         "size": "1024x1024",
     }
-
-
-def test_generate_grok_image_uses_dedicated_images_api(monkeypatch):
-    calls = []
-
-    class FakeResponse:
-        def __init__(self, *, payload=None, content=b""):
-            self.status_code = 200
-            self._payload = payload
-            self.content = content
-            self.text = ""
-
-        def json(self):
-            return self._payload
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            calls.append(("init", kwargs))
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def post(self, url, headers=None, json=None):
-            calls.append(("post", url, headers, json))
-            return FakeResponse(payload={"data": [{"url": "https://cdn.example/img.jpg"}]})
-
-        async def get(self, url):
-            calls.append(("get", url))
-            return FakeResponse(content=b"grok-image")
-
-    monkeypatch.setattr(bot.httpx, "AsyncClient", FakeClient)
-    monkeypatch.setattr(bot, "GROK_API_BASE_URL", "https://grok.example/v1")
-    monkeypatch.setattr(bot, "GROK_API_KEY", "test-grok-key")
-
-    out = asyncio.run(bot._generate_grok_image("画一只猫"))
-
-    assert out == b"grok-image"
-    assert calls[1][0:2] == ("post", "https://grok.example/v1/images/generations")
-    assert calls[1][2]["Authorization"] == "Bearer test-grok-key"
-    assert calls[1][3] == {
-        "model": "grok-imagine-image-2.0",
-        "prompt": "画一只猫",
-        "n": 1,
-        "size": "1024x1024",
-    }
-    assert calls[2] == ("get", "https://cdn.example/img.jpg")
-
-
-def test_gkimg_command_sends_raw_user_prompt_without_expansion(monkeypatch):
-    seen = []
-
-    async def fail_expand(prompt):
-        raise AssertionError("/gkimg must not expand the user prompt")
-
-    async def fake_generate(prompt):
-        seen.append(prompt)
-        return b"jpeg-bytes"
-
-    async def fake_reply_text(msg, text, **kwargs):
-        return SimpleNamespace(chat_id=-100123, message_id=101)
-
-    async def fake_reply_photo(*, photo, caption, parse_mode):
-        assert photo.read() == b"jpeg-bytes"
-        assert "一只猫" in caption
-
-    async def fake_delete_message(**kwargs):
-        return None
-
-    monkeypatch.setattr(bot, "_expand_image_prompt", fail_expand)
-    monkeypatch.setattr(bot, "_generate_grok_image", fake_generate)
-    monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
-    monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
-    monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
-
-    msg = SimpleNamespace(
-        text="/gkimg 一只猫",
-        caption=None,
-        message_id=100,
-        from_user=SimpleNamespace(id=1),
-        reply_to_message=None,
-        photo=None,
-        document=None,
-        reply_photo=fake_reply_photo,
-    )
-    chat = SimpleNamespace(id=-100123, type=bot.ChatType.SUPERGROUP)
-    context = SimpleNamespace(
-        user_data={},
-        bot=SimpleNamespace(delete_message=fake_delete_message),
-    )
-
-    asyncio.run(
-        bot.on_image_request(
-            SimpleNamespace(effective_message=msg, effective_chat=chat),
-            context,
-        )
-    )
-
-    assert seen == ["一只猫"]
-
-
-def test_create_grok_video_task_uses_dedicated_api_contract(monkeypatch):
-    captured = {}
-
-    class FakeResponse:
-        status_code = 200
-
-        def json(self):
-            return {"request_id": "video-test"}
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def post(self, url, headers=None, json=None):
-            captured.update(url=url, headers=headers, json=json)
-            return FakeResponse()
-
-    monkeypatch.setattr(bot.httpx, "AsyncClient", FakeClient)
-    monkeypatch.setattr(bot, "GROK_API_BASE_URL", "https://grok.example/v1")
-    monkeypatch.setattr(bot, "GROK_API_KEY", "test-grok-key")
-    monkeypatch.setattr(bot, "VIDEO_MODEL", "grok-imagine-video-1.5")
-
-    result = asyncio.run(bot._create_video_task("让云层缓慢移动"))
-
-    assert result == "video-test"
-    assert captured["url"] == "https://grok.example/v1/videos/generations"
-    assert captured["headers"]["Authorization"] == "Bearer test-grok-key"
-    assert captured["json"] == {
-        "model": "grok-imagine-video-1.5",
-        "prompt": "让云层缓慢移动",
-        "duration": bot.VIDEO_DURATION,
-        "aspect_ratio": bot.VIDEO_ASPECT_RATIO,
-        "resolution": bot.VIDEO_RESOLUTION,
-    }
-
-
-def test_poll_and_download_grok_video_use_dedicated_api(monkeypatch):
-    calls = []
-
-    class FakeResponse:
-        status_code = 200
-        text = ""
-
-        def __init__(self, *, payload=None, content=b""):
-            self._payload = payload
-            self.content = content
-
-        def json(self):
-            return self._payload
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            calls.append(("init", kwargs))
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def get(self, url, headers=None):
-            calls.append(("get", url, headers))
-            if url.endswith("/content"):
-                return FakeResponse(content=b"video-bytes")
-            return FakeResponse(payload={"status": "done", "progress": 100})
-
-    monkeypatch.setattr(bot.httpx, "AsyncClient", FakeClient)
-    monkeypatch.setattr(bot, "GROK_API_BASE_URL", "https://grok.example/v1")
-    monkeypatch.setattr(bot, "GROK_API_KEY", "test-grok-key")
-
-    content_url = asyncio.run(bot._poll_video_result("task/with slash"))
-    content = asyncio.run(bot._download_video(content_url))
-
-    assert content_url == (
-        "https://grok.example/v1/videos/generations/task%2Fwith%20slash/content"
-    )
-    assert content == b"video-bytes"
-    get_calls = [call for call in calls if call[0] == "get"]
-    assert get_calls[0] == (
-        "get",
-        "https://grok.example/v1/videos/generations/task%2Fwith%20slash",
-        {"Authorization": "Bearer test-grok-key"},
-    )
-    assert get_calls[1] == (
-        "get",
-        content_url,
-        {"Authorization": "Bearer test-grok-key"},
-    )
-
-
-def test_video_failure_message_distinguishes_content_policy():
-    assert bot._video_failure_message(
-        RuntimeError(
-            'Video create HTTP 403: {"type":"content_policy_violation",'
-            '"message":"内容审计命中风险规则"}'
-        )
-    ) == "视频生成被上游内容审计拒绝，请调整提示词或图片后重试。"
-    assert bot._video_failure_message(
-        RuntimeError("Video create HTTP 502")
-    ) == "视频生成失败，请稍后再试。"
 
 
 JAVDB_ACTOR_SEARCH_HTML = """

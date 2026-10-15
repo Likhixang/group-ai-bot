@@ -21,9 +21,6 @@ cp .env.example .env
 - （可选）`OAI_MODEL`
 - （可选）`IMAGE_MODEL` — 图片生成模型名（默认 gpt-image-2）
 - （可选）`IMAGE_EDIT_MODEL` — 图生图模型名（默认同 IMAGE_MODEL）
-- `GROK_API_BASE_URL` — `/gkimg` 和 `/vid` 使用的 API 地址
-- `GROK_API_KEY` — `/gkimg` 和 `/vid` 使用的独立 API key
-- （可选）`GROK_IMAGE_MODEL` — `/gkimg` 图片生成模型名（默认 grok-imagine-image-2.0）
 - （可选）`IMAGE_ASPECT_RATIO` — 画幅：1:1 / 3:4 / 4:3 / 9:16 / 16:9
 
 - （可选）`MEMORY_MAX_TURNS`
@@ -61,12 +58,8 @@ docker compose logs -f group-ai-bot
 ## 3. 群里使用
 
 - 单独发送 HEX 颜色代码（`#RGB`、`#RRGGBB` 或 `RRGGBB`，大小写均可），直接回复生成的 52×52 PNG 色块，不调用 AI；输入消息和色块回复按全局清理 TTL（当前 30 秒）一起删除。沿用现有群组/话题权限，普通文字和编辑消息不触发。
-- `grok 你的问题`（文本快模：`grok-4-1-fast`）
-- `grokt 你的问题`（文本深度思考：`grok-4-1-thinking`）
 - `oai 你的问题` 或 `/oai 你的问题`（GPT 模型：`gpt-5.5`）
 - `img 你的描述词` 或 `/img 你的描述词`：用 `gpt-image-2` 生成图片
-- `/gkimg 你的描述词`：用 `grok-imagine-image-2.0` 生成图片
-- `/vid 你的描述词`：用 `grok-imagine-video-1.5` 生成视频
 - 回复机器人文字消息可继续文本上下文（不用前缀）
 - 回复机器人生成的图片并输入修改要求，会自动改图
 - `edit 修改要求` 或 `/edit 修改要求`：修改被回复的图片；也支持上传图片并在 caption 写改图要求
@@ -95,4 +88,3 @@ docker compose logs -f group-ai-bot
 ## 5. 安全建议
 
 - 不要把 `.env` 提交到 git。
-- `AI_API_KEY`、`GROK_API_KEY`、`TELEGRAM_BOT_TOKEN` 只放环境变量。
