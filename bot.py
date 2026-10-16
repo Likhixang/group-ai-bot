@@ -17,7 +17,7 @@ from html import escape, unescape
 from html.parser import HTMLParser
 from typing import Optional
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
@@ -30,7 +30,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatMemberStatus, ChatType, MessageEntityType, ParseMode
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -242,7 +242,7 @@ SOFT_BAN_NOTICE_TTL = NOTICE_DELETE_TTL
 SOFT_BAN_REPEAT_COOLDOWN = 2
 # chat_id:user_id -> last_notice_ts
 _SOFT_BAN_LAST_NOTICE: dict[str, int] = {}
-# chat_id:user_id -> asyncio.Task（提醒的定时删除任务，编辑时取消重排）
+# chat_id:user_id -> asyncio.Task（当前提醒的删除任务；编辑不延长 TTL）
 _SOFT_BAN_NOTICE_DELETE_TASKS: dict[str, "asyncio.Task"] = {}
 
 def _extract_first_url(text: str) -> Optional[str]:
@@ -5517,6 +5517,72 @@ def _schedule_delete_messages(
     )
 
 
+async def _delete_soft_ban_notice_later(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    message_id: int,
+    delay_seconds: int,
+) -> None:
+    """删除指定提醒；临时 API 错误重试，旧任务不触碰新提醒的状态。"""
+    key = f"{chat_id}:{user_id}"
+    try:
+        await asyncio.sleep(delay_seconds)
+        for attempt in range(3):
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except BadRequest as exc:
+                if "message to delete not found" not in str(exc).lower():
+                    logger.warning(
+                        "soft_ban_notice_delete failed chat=%s user=%s msg=%s: %s",
+                        chat_id, user_id, message_id, exc,
+                    )
+                    return
+            except (RetryAfter, NetworkError) as exc:
+                if attempt == 2:
+                    logger.warning(
+                        "soft_ban_notice_delete failed chat=%s user=%s msg=%s: %s",
+                        chat_id, user_id, message_id, exc,
+                    )
+                    return
+                delay = exc.retry_after if isinstance(exc, RetryAfter) else 2 ** attempt
+                if isinstance(delay, timedelta):
+                    delay = delay.total_seconds()
+                await asyncio.sleep(delay)
+                continue
+            except Exception:
+                logger.warning(
+                    "soft_ban_notice_delete failed chat=%s user=%s msg=%s",
+                    chat_id, user_id, message_id, exc_info=True,
+                )
+                return
+            current = _load_soft_ban_notice(chat_id, user_id)
+            if current and current[0] == message_id:
+                _remove_soft_ban_notice(chat_id, user_id)
+            return
+    finally:
+        if _SOFT_BAN_NOTICE_DELETE_TASKS.get(key) is asyncio.current_task():
+            _SOFT_BAN_NOTICE_DELETE_TASKS.pop(key, None)
+
+
+def _ensure_soft_ban_notice_cleanup(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    message_id: int,
+    created_at: int,
+) -> None:
+    """按首次发送时间计算全局 TTL；重启后再次遇到提醒时补排剩余时间。"""
+    key = f"{chat_id}:{user_id}"
+    task = _SOFT_BAN_NOTICE_DELETE_TASKS.get(key)
+    if task is not None and not task.done():
+        return
+    delay = max(0, created_at + NOTICE_DELETE_TTL - int(time.time()))
+    _SOFT_BAN_NOTICE_DELETE_TASKS[key] = context.application.create_task(
+        _delete_soft_ban_notice_later(context, chat_id, user_id, message_id, delay)
+    )
+
+
 async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Soft ban: 被 /ban 的用户一发言就立刻删消息，并 @ 提醒剩余时长。"""
     msg = update.effective_message
@@ -5582,8 +5648,9 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     old = _load_soft_ban_notice(chat.id, user.id)
     if old:
-        # 编辑已有提醒，让剩余时间实时更新
-        mid = old[0]
+        # 编辑只更新文字，不重置发送时间或取消原消息的清理任务。
+        mid, created_at = old
+        _ensure_soft_ban_notice_cleanup(context, chat.id, user.id, mid, created_at)
         try:
             await context.bot.edit_message_text(
                 chat_id=chat.id,
@@ -5592,23 +5659,31 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-            _save_soft_ban_notice(chat.id, user.id, mid, now_ts)
-            # 取消旧定时删除任务，重新安排（延长 TTL 从最新编辑时刻算起）
-            old_task = _SOFT_BAN_NOTICE_DELETE_TASKS.pop(key, None)
-            if old_task and hasattr(old_task, 'cancel'):
-                old_task.cancel()
-            new_task = context.application.create_task(
-                _delete_messages_later(context, chat.id, [mid], SOFT_BAN_NOTICE_TTL)
-            )
-            _SOFT_BAN_NOTICE_DELETE_TASKS[key] = new_task
-            raise ApplicationHandlerStop
-        except ApplicationHandlerStop:
-            raise
+        except BadRequest as exc:
+            error = str(exc).lower()
+            if "message is not modified" in error:
+                raise ApplicationHandlerStop
+            if "message to edit not found" not in error:
+                logger.warning(
+                    "soft_ban_notice_edit failed chat=%s user=%s msg=%s: %s",
+                    chat.id, user.id, mid, exc,
+                )
+                raise ApplicationHandlerStop
+            # 仅原消息已不存在时换新；旧任务继续负责旧消息，不能取消。
+            current = _load_soft_ban_notice(chat.id, user.id)
+            if current and current[0] == mid:
+                _remove_soft_ban_notice(chat.id, user.id)
+            _SOFT_BAN_NOTICE_DELETE_TASKS.pop(key, None)
         except Exception:
-            # 编辑失败（消息已被定时删除等），退到发新消息
-            _remove_soft_ban_notice(chat.id, user.id)
+            logger.warning(
+                "soft_ban_notice_edit failed chat=%s user=%s msg=%s",
+                chat.id, user.id, mid, exc_info=True,
+            )
+            raise ApplicationHandlerStop
+        else:
+            raise ApplicationHandlerStop
 
-    # 没有旧提醒或编辑失败，发新消息
+    # 没有旧提醒或旧消息已被删除，发新消息并按全局 TTL 安排独立清理。
     try:
         sent = await context.bot.send_message(
             chat_id=chat.id,
@@ -5616,15 +5691,14 @@ async def enforce_soft_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        _save_soft_ban_notice(chat.id, user.id, sent.message_id, now_ts)
-        # 取消旧任务（如果有残留）
-        old_task = _SOFT_BAN_NOTICE_DELETE_TASKS.pop(key, None)
-        if old_task and hasattr(old_task, 'cancel'):
-            old_task.cancel()
-        new_task = context.application.create_task(
-            _delete_messages_later(context, chat.id, [sent.message_id], SOFT_BAN_NOTICE_TTL)
+        created_at = int(time.time())
+        # 先安排删除，避免持久化失败后已发出的消息没有清理任务。
+        _SOFT_BAN_NOTICE_DELETE_TASKS[key] = context.application.create_task(
+            _delete_soft_ban_notice_later(
+                context, chat.id, user.id, sent.message_id, NOTICE_DELETE_TTL
+            )
         )
-        _SOFT_BAN_NOTICE_DELETE_TASKS[key] = new_task
+        _save_soft_ban_notice(chat.id, user.id, sent.message_id, created_at)
     except Exception:
         logger.warning(
             "soft_ban_repeat_notice failed chat=%s user=%s",
