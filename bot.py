@@ -3870,7 +3870,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"/lm 或 lm 你的问题 — 对话 ({LUMO_MODEL})\n"
             f"/ln 或 ln 你的问题 — 对话 ({LUNA_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
-            "/qimg 或 qimg 提示词 — Qwen生成图片\n"
+            "/qimg 或 qimg 提示词 — Qwen生成图片（30秒后自动删除）\n"
             "/edit 或 edit 要求 — 回复图片改图（或上传图+写 caption）\n"
             "/av 番号 — 查询封面（Fourhoi → R18.dev）；回复图片发 /av，或图片 caption 写 /av 检索番号（AVScan）\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
@@ -5095,7 +5095,7 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"<blockquote>模型: {escape(model_name)}</blockquote>\n"
             f"<blockquote>提示词: {escape(final_prompt[:850])}</blockquote>"
         )
-        await msg.reply_photo(
+        sent = await msg.reply_photo(
             photo=_photo_file(image_bytes),
             caption=caption,
             parse_mode=ParseMode.HTML,
@@ -5104,6 +5104,9 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.delete_message(chat_id=status.chat_id, message_id=status.message_id)
         except Exception:
             pass
+        if is_qwen_generation:
+            cleanup_task = getattr(getattr(context, "application", None), "create_task", asyncio.create_task)
+            cleanup_task(_auto_delete_after(msg, sent, context, delay=NOTICE_DELETE_TTL))
         logger.info(
             "image_response_complete: chat=%s msg=%s mode=%s model=%s bytes=%s",
             chat.id,

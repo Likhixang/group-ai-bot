@@ -776,6 +776,7 @@ def test_av_actor_lookup_pipeline_accepts_english_name_without_javdb(monkeypatch
 
 def test_img_command_uses_raw_prompt_without_luna_expansion(monkeypatch):
     seen = []
+    cleanups = []
 
     async def fail_expand(prompt):
         raise AssertionError("/img must not expand the user prompt with luna")
@@ -790,18 +791,31 @@ def test_img_command_uses_raw_prompt_without_luna_expansion(monkeypatch):
     async def fake_reply_text(msg, text, **kwargs):
         return SimpleNamespace(chat_id=-100123, message_id=101)
 
+    sent_photo = SimpleNamespace(message_id=202, chat_id=-100123)
+
     async def fake_reply_photo(*, photo, caption, parse_mode):
         assert photo.read() == b"image-bytes"
         assert "画一只猫" in caption
         assert bot.IMAGE_MODEL in caption
+        return sent_photo
 
     async def fake_delete_message(**kwargs):
         return None
+
+    async def fake_auto_delete(cmd_msg, reply_msg, context, *, delay=bot.NOTICE_DELETE_TTL):
+        cleanups.append((cmd_msg, reply_msg, delay))
+
+    scheduled_tasks = []
+
+    def fake_create_task(coro):
+        scheduled_tasks.append(coro)
+        coro.close()
 
     monkeypatch.setattr(bot, "_expand_image_prompt", fail_expand)
     monkeypatch.setattr(bot, "_find_reference_image", fake_find_reference)
     monkeypatch.setattr(bot, "_generate_image", fake_generate)
     monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
+    monkeypatch.setattr(bot, "_auto_delete_after", fake_auto_delete)
     monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
     monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
 
@@ -809,6 +823,7 @@ def test_img_command_uses_raw_prompt_without_luna_expansion(monkeypatch):
         text="/img 画一只猫",
         caption=None,
         message_id=100,
+        chat_id=-100123,
         from_user=SimpleNamespace(id=1),
         reply_to_message=None,
         photo=None,
@@ -819,6 +834,7 @@ def test_img_command_uses_raw_prompt_without_luna_expansion(monkeypatch):
     context = SimpleNamespace(
         user_data={},
         bot=SimpleNamespace(delete_message=fake_delete_message),
+        application=SimpleNamespace(create_task=fake_create_task),
     )
 
     asyncio.run(
@@ -829,10 +845,14 @@ def test_img_command_uses_raw_prompt_without_luna_expansion(monkeypatch):
     )
 
     assert seen == [("画一只猫", bot.IMAGE_MODEL)]
+    # /img 保持原样，不自动删除
+    assert cleanups == []
+    assert scheduled_tasks == []
 
 
-def test_qimg_command_calls_qwen_image_with_raw_prompt(monkeypatch):
+def test_qimg_command_calls_qwen_image_with_raw_prompt_and_auto_deletes(monkeypatch):
     seen = []
+    cleanups = []
 
     async def fail_expand(prompt):
         raise AssertionError("/qimg must not expand the user prompt with luna")
@@ -847,18 +867,35 @@ def test_qimg_command_calls_qwen_image_with_raw_prompt(monkeypatch):
     async def fake_reply_text(msg, text, **kwargs):
         return SimpleNamespace(chat_id=-100123, message_id=101)
 
+    sent_photo = SimpleNamespace(message_id=202, chat_id=-100123)
+
     async def fake_reply_photo(*, photo, caption, parse_mode):
         assert photo.read() == b"qwen-image-bytes"
         assert "赛博朋克猫" in caption
         assert "qwen-image" in caption
+        return sent_photo
 
     async def fake_delete_message(**kwargs):
         return None
+
+    async def fake_auto_delete(cmd_msg, reply_msg, context, *, delay=bot.NOTICE_DELETE_TTL):
+        cleanups.append((cmd_msg, reply_msg, delay))
+
+    scheduled_tasks = []
+
+    def fake_create_task(coro):
+        scheduled_tasks.append(coro)
+        # 实际执行协程以触发 fake_auto_delete
+        try:
+            coro.send(None)
+        except StopIteration:
+            pass
 
     monkeypatch.setattr(bot, "_expand_image_prompt", fail_expand)
     monkeypatch.setattr(bot, "_find_reference_image", fail_reference)
     monkeypatch.setattr(bot, "_generate_image", fake_generate)
     monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
+    monkeypatch.setattr(bot, "_auto_delete_after", fake_auto_delete)
     monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
     monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
 
@@ -866,6 +903,7 @@ def test_qimg_command_calls_qwen_image_with_raw_prompt(monkeypatch):
         text="/qimg 赛博朋克猫",
         caption=None,
         message_id=100,
+        chat_id=-100123,
         from_user=SimpleNamespace(id=1),
         reply_to_message=None,
         photo=None,
@@ -876,6 +914,7 @@ def test_qimg_command_calls_qwen_image_with_raw_prompt(monkeypatch):
     context = SimpleNamespace(
         user_data={},
         bot=SimpleNamespace(delete_message=fake_delete_message),
+        application=SimpleNamespace(create_task=fake_create_task),
     )
 
     asyncio.run(
@@ -886,3 +925,6 @@ def test_qimg_command_calls_qwen_image_with_raw_prompt(monkeypatch):
     )
 
     assert seen == [("赛博朋克猫", bot.QWEN_IMAGE_MODEL)]
+    # /qimg 跟随全局 30 秒删除命令和图片
+    assert len(scheduled_tasks) == 1
+    assert cleanups == [(msg, sent_photo, bot.NOTICE_DELETE_TTL)]

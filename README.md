@@ -60,7 +60,7 @@ docker compose logs -f group-ai-bot
 - Send a standalone HEX color (`#RGB`, `#RRGGBB`, or `RRGGBB`, case-insensitive) to get a 52×52 color swatch generated as PNG, without calling AI. The input and swatch are deleted after the global cleanup TTL (currently 30 seconds). Existing chat/topic permissions apply; normal text and edited messages do not trigger it.
 - `oai your question` or `/oai your question` (GPT model: `gpt-5.5`)
 - `img your prompt` or `/img your prompt` — generate an image with `gpt-image-2`
-- `qimg your prompt` or `/qimg your prompt` — generate an image with `qwen-image`
+- `qimg your prompt` or `/qimg your prompt` — generate an image with `qwen-image` (auto-deleted after 30 seconds)
 - Reply to a bot-generated text message to continue the text context (no prefix needed)
 - Reply to a bot-generated image with edit instructions to modify that image
 - `edit your instructions` or `/edit your instructions` — edit the replied image; also works when uploading a photo with the edit instruction as caption
