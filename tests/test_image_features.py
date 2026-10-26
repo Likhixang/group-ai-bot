@@ -51,21 +51,17 @@ def test_clean_prompt_and_select_text_model_for_gm():
     assert bot._is_text_ai_prefix("gmx 测试") is False
 
 
-def test_clean_prompt_and_select_text_model_for_lm():
-    assert bot.LUMO_MODEL == "lumo-2.0-max"
-    assert bot._clean_prompt("lm 你好") == "你好"
-    assert bot._clean_prompt("/lm 你好") == "你好"
-    assert bot._clean_prompt("lm") == ""
-    assert bot._clean_prompt("/lm") == ""
-    assert bot._select_text_model("lm 你好") == bot.LUMO_MODEL
-    assert bot._select_text_model("/lm 你好") == bot.LUMO_MODEL
-    assert bot._select_text_model("lm") == bot.LUMO_MODEL
-    assert bot._select_text_model("/lm") == bot.LUMO_MODEL
-    assert bot._is_text_ai_prefix("lm 测试") is True
-    assert bot._is_text_ai_prefix("/lm 测试") is True
-    assert bot._is_text_ai_prefix("lm") is True
-    assert bot._is_text_ai_prefix("/lm") is True
-    assert bot._is_text_ai_prefix("lmx 测试") is False
+def test_lm_command_is_removed():
+    assert not hasattr(bot, "LUMO_MODEL")
+    # /lm 不再是前缀：不会剥离、不会路由到独立模型，也不会触发 AI 回复
+    assert bot._clean_prompt("lm 你好") == "lm 你好"
+    assert bot._clean_prompt("/lm 你好") == "/lm 你好"
+    assert bot._select_text_model("lm 你好") == bot.DS_MODEL
+    assert bot._select_text_model("/lm 你好") == bot.DS_MODEL
+    assert bot._is_text_ai_prefix("lm 测试") is False
+    assert bot._is_text_ai_prefix("/lm 测试") is False
+    assert bot._is_text_ai_prefix("lm") is False
+    assert bot._is_text_ai_prefix("/lm") is False
 
 
 def test_image_request_detection_handles_prefixes_and_commands():

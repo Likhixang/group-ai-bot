@@ -66,7 +66,6 @@ AI_THINKING_MODEL = os.getenv("AI_THINKING_MODEL", "ds-4.1-thinking").strip()
 OAI_MODEL = os.getenv("OAI_MODEL", "gpt-5.5").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-6-luna").strip()
-LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
 QWEN_IMAGE_MODEL = os.getenv("QWEN_IMAGE_MODEL", "qwen-image").strip()
@@ -1000,9 +999,7 @@ def _is_text_ai_prefix(raw_text: str) -> bool:
         or text.startswith("/gm ")
         or text.startswith("ln ")
         or text.startswith("/ln ")
-        or text.startswith("lm ")
-        or text.startswith("/lm ")
-        or text in {"ds", "/ds", "gm", "/gm", "ln", "/ln", "lm", "/lm"}
+        or text in {"ds", "/ds", "gm", "/gm", "ln", "/ln"}
     )
 
 
@@ -1055,12 +1052,12 @@ def _is_reply_to_this_bot(msg) -> bool:
 def _clean_prompt(raw_text: str) -> str:
     text = raw_text.strip()
     low = text.lower()
-    for prefix in ("/ds ", "ds ", "/gm ", "gm ", "/ln ", "ln ", "/lm ", "lm "):
+    for prefix in ("/ds ", "ds ", "/gm ", "gm ", "/ln ", "ln "):
         if low.startswith(prefix):
             text = text[len(prefix):].strip()
             break
     else:
-        if low in {"/ds", "ds", "/gm", "gm", "/ln", "ln", "/lm", "lm"}:
+        if low in {"/ds", "ds", "/gm", "gm", "/ln", "ln"}:
             text = ""
     # Strip leading @bot_username mention
     if BOT_USERNAME:
@@ -1096,7 +1093,7 @@ def _inherit_text_model_from_reply(msg) -> Optional[str]:
     if not model_name:
         logger.info("model_inherit: no model line found in replied text")
         return None
-    if model_name in {DS_MODEL, AI_THINKING_MODEL, OAI_MODEL, GEMINI_MODEL, LUNA_MODEL, LUMO_MODEL}:
+    if model_name in {DS_MODEL, AI_THINKING_MODEL, OAI_MODEL, GEMINI_MODEL, LUNA_MODEL}:
         logger.info("model_inherit: inherited model=%s", model_name)
         return model_name
     logger.info("model_inherit: model line found but not allowed model=%s", model_name)
@@ -1109,8 +1106,6 @@ def _select_text_model(raw_text: str, msg=None) -> str:
         return GEMINI_MODEL
     if low.startswith("/ln ") or low.startswith("ln ") or low in {"/ln", "ln"}:
         return LUNA_MODEL
-    if low.startswith("/lm ") or low.startswith("lm ") or low in {"/lm", "lm"}:
-        return LUMO_MODEL
     if low.startswith("/ds ") or low.startswith("ds ") or low in {"/ds", "ds"}:
         return DS_MODEL
     inherited = _inherit_text_model_from_reply(msg) if msg is not None else None
@@ -3899,7 +3894,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "用法:\n"
             f"/ds 或 ds 你的问题 — 对话 ({DS_MODEL})\n"
             f"/gm 或 gm 你的问题 — 对话 ({GEMINI_MODEL})\n"
-            f"/lm 或 lm 你的问题 — 对话 ({LUMO_MODEL})\n"
             f"/ln 或 ln 你的问题 — 对话 ({LUNA_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
             "/qimg 或 qimg 提示词 — Qwen生成图片（30秒后自动删除）\n"
@@ -4641,7 +4635,7 @@ def _message_prompt_text(msg) -> str:
 
 
 async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /ds, /gm, /ln and /lm commands by forwarding to on_text with prefix restored."""
+    """Handle /ds, /gm and /ln commands by forwarding to on_text with prefix restored."""
     msg = update.effective_message
     if not msg:
         return
@@ -5064,11 +5058,9 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             (
                 raw_lower.startswith("ds ")
                 or raw_lower.startswith("gm ")
-                or raw_lower.startswith("lm ")
                 or raw_lower.startswith("ln ")
                 or raw_lower.startswith("/ds ")
                 or raw_lower.startswith("/gm ")
-                or raw_lower.startswith("/lm ")
                 or raw_lower.startswith("/ln ")
             )
             and own_image_file_id
@@ -6903,7 +6895,6 @@ async def post_init(application: Application) -> None:
     commands = [
         BotCommand("ds", f"对话 ({DS_MODEL})"),
         BotCommand("gm", f"对话 ({GEMINI_MODEL})"),
-        BotCommand("lm", f"对话 ({LUMO_MODEL})"),
         BotCommand("ln", f"对话 ({LUNA_MODEL})"),
         BotCommand("img", "生成图片"),
         BotCommand("qimg", "Qwen生成图片"),
@@ -6992,7 +6983,7 @@ def main() -> None:
     app.add_handler(CommandHandler("av", av_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("allow", allow_cmd))
-    app.add_handler(CommandHandler(["ds", "gm", "lm", "ln"], ai_cmd))
+    app.add_handler(CommandHandler(["ds", "gm", "ln"], ai_cmd))
     app.add_handler(CommandHandler("ip", ip_cmd))
     app.add_handler(CommandHandler("dc", dc_cmd))
     app.add_handler(CommandHandler("whois", whois_cmd))
