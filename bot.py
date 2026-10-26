@@ -5360,7 +5360,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 context,
                 chat_id=reply.chat_id,
                 message_id=reply.message_id,
-                text=_render_quote_text("AI 服务暂时不可用，请稍后再试。"),
+                text=_render_quote_text("AI 服务暂时不可用，请稍后再试。", text_model),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -5376,7 +5376,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context,
             chat_id=reply.chat_id,
             message_id=reply.message_id,
-            text=_render_quote_text("AI 服务暂时不可用，请稍后再试。"),
+            text=_render_quote_text("AI 服务暂时不可用，请稍后再试。", text_model),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
