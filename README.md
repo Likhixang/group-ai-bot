@@ -18,10 +18,8 @@ Edit `.env` and fill in:
 - `AI_BASE_URL`
 - `AI_API_KEY`
 - (optional) `AI_MODEL`
-- (optional) `OAI_MODEL`
 - (optional) `IMAGE_MODEL` — 图片生成模型名（默认 gpt-image-2）
 - (optional) `IMAGE_EDIT_MODEL` — 图生图模型名（默认同 IMAGE_MODEL）
-- (optional) `IMAGE_ASPECT_RATIO` — 画幅: 1:1 / 3:4 / 4:3 / 9:16 / 16:9
 
 - (optional) `MEMORY_MAX_TURNS`
 
@@ -31,11 +29,6 @@ Edit `.env` and fill in:
 - (optional) `ALLOWED_CHAT_USERNAMES`
 - (optional) `ALLOWED_TOPIC_IDS`
 
-- (optional) `TIMED_TOPIC_CHAT_ID`
-- (optional) `TIMED_TOPIC_ID`
-- (optional) `TIMED_TOPIC_TZ`
-- (optional) `TIMED_OPEN_HOUR`
-- (optional) `TIMED_CLOSE_HOUR`
 - (optional) `PIN_TARGET_CHAT_ID`
 - (optional) `PIN_TARGET_TOPIC_ID`
 - (optional) `PIN_TZ`

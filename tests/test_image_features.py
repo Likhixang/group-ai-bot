@@ -9,8 +9,6 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 os.environ.setdefault("AI_API_KEY", "test-key")
 os.environ.setdefault("AI_BASE_URL", "http://127.0.0.1:8090/v1")
 os.environ.setdefault("DS_MODEL", "deepseek-v4-flash")
-os.environ.setdefault("AI_THINKING_MODEL", "deepseek-v4-pro")
-os.environ.setdefault("OAI_MODEL", "gpt-5.5")
 os.environ.setdefault("IMAGE_MODEL", "gpt-image-2")
 os.environ.setdefault("IMAGE_EDIT_MODEL", "gpt-image-2")
 
@@ -774,9 +772,6 @@ def test_img_command_uses_raw_prompt_without_luna_expansion(monkeypatch):
     seen = []
     cleanups = []
 
-    async def fail_expand(prompt):
-        raise AssertionError("/img must not expand the user prompt with luna")
-
     async def fake_find_reference(prompt):
         return None
 
@@ -807,7 +802,6 @@ def test_img_command_uses_raw_prompt_without_luna_expansion(monkeypatch):
         scheduled_tasks.append(coro)
         coro.close()
 
-    monkeypatch.setattr(bot, "_expand_image_prompt", fail_expand)
     monkeypatch.setattr(bot, "_find_reference_image", fake_find_reference)
     monkeypatch.setattr(bot, "_generate_image", fake_generate)
     monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
@@ -850,9 +844,6 @@ def test_qimg_command_calls_qwen_image_with_raw_prompt_and_auto_deletes(monkeypa
     seen = []
     cleanups = []
 
-    async def fail_expand(prompt):
-        raise AssertionError("/qimg must not expand the user prompt with luna")
-
     async def fail_reference(prompt):
         raise AssertionError("/qimg must not search for reference images")
 
@@ -887,7 +878,6 @@ def test_qimg_command_calls_qwen_image_with_raw_prompt_and_auto_deletes(monkeypa
         except StopIteration:
             pass
 
-    monkeypatch.setattr(bot, "_expand_image_prompt", fail_expand)
     monkeypatch.setattr(bot, "_find_reference_image", fail_reference)
     monkeypatch.setattr(bot, "_generate_image", fake_generate)
     monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)

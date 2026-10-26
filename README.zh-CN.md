@@ -18,10 +18,8 @@ cp .env.example .env
 - `AI_BASE_URL`
 - `AI_API_KEY`
 - （可选）`AI_MODEL`
-- （可选）`OAI_MODEL`
 - （可选）`IMAGE_MODEL` — 图片生成模型名（默认 gpt-image-2）
 - （可选）`IMAGE_EDIT_MODEL` — 图生图模型名（默认同 IMAGE_MODEL）
-- （可选）`IMAGE_ASPECT_RATIO` — 画幅：1:1 / 3:4 / 4:3 / 9:16 / 16:9
 
 - （可选）`MEMORY_MAX_TURNS`
 
@@ -31,11 +29,6 @@ cp .env.example .env
 - （可选）`ALLOWED_CHAT_USERNAMES`
 - （可选）`ALLOWED_TOPIC_IDS`
 
-- （可选）`TIMED_TOPIC_CHAT_ID`
-- （可选）`TIMED_TOPIC_ID`
-- （可选）`TIMED_TOPIC_TZ`
-- （可选）`TIMED_OPEN_HOUR`
-- （可选）`TIMED_CLOSE_HOUR`
 - （可选）`PIN_TARGET_CHAT_ID`
 - （可选）`PIN_TARGET_TOPIC_ID`
 - （可选）`PIN_TZ`

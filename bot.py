@@ -9,8 +9,6 @@ import sqlite3
 import re
 import urllib.parse
 import base64
-import xml.etree.ElementTree as ET
-from email.utils import parsedate_to_datetime
 from io import BytesIO
 from collections import defaultdict
 from html import escape, unescape
@@ -25,11 +23,10 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
-    Message,
     MessageEntity,
     Update,
 )
-from telegram.constants import ChatMemberStatus, ChatType, MessageEntityType, ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
@@ -62,8 +59,6 @@ DS_MODEL = (
     or os.getenv("AI_MODEL")
     or "deepseek-v4-flash"
 ).strip()
-AI_THINKING_MODEL = os.getenv("AI_THINKING_MODEL", "ds-4.1-thinking").strip()
-OAI_MODEL = os.getenv("OAI_MODEL", "gpt-5.5").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-6-luna").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
@@ -106,9 +101,6 @@ CODEX_RESET_ENABLED = os.getenv("CODEX_RESET_ENABLED", "1").strip().lower() not 
 }
 CODEX_RESET_POLL_INTERVAL = max(30, int(os.getenv("CODEX_RESET_POLL_INTERVAL", "120")))
 CODEX_RESET_PIN_SECONDS = max(60, int(os.getenv("CODEX_RESET_PIN_SECONDS", "1800")))
-CODEX_RESET_MAX_DESCRIPTION = max(
-    200, int(os.getenv("CODEX_RESET_MAX_DESCRIPTION", "1200"))
-)
 CODEX_RESET_API_URL = os.getenv(
     "CODEX_RESET_API_URL", "https://codex-resets.com/api/v1/status"
 ).strip()
@@ -119,7 +111,6 @@ BOT_USERNAME: Optional[str] = None
 BOT_ID: Optional[int] = None
 MEMORY_LOCKS = defaultdict(asyncio.Lock)
 PIN_LOCK = asyncio.Lock()
-URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 TG_USER_URL_RE = re.compile(r"tg://user\?id=(\d+)", re.IGNORECASE)
 MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((https?://[^)\s]+)\)", re.IGNORECASE)
 HTML_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
@@ -245,22 +236,6 @@ _SOFT_BAN_LAST_NOTICE: dict[str, int] = {}
 # chat_id:user_id -> asyncio.Task（当前提醒的删除任务；编辑不延长 TTL）
 _SOFT_BAN_NOTICE_DELETE_TASKS: dict[str, "asyncio.Task"] = {}
 
-def _extract_first_url(text: str) -> Optional[str]:
-    m = URL_PATTERN.search(text or "")
-    if not m:
-        return None
-    return m.group(0).rstrip(".,;:!?)]}>\"'")
-
-
-def _extract_all_urls(text: str) -> list[str]:
-    urls = []
-    for m in URL_PATTERN.finditer(text or ""):
-        u = m.group(0).rstrip(".,;:!?)]}>\"'")
-        if u:
-            urls.append(u)
-    return urls
-
-
 def _is_timeout_error(exc: Exception) -> bool:
     if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError, TimedOut)):
         return True
@@ -369,12 +344,6 @@ def _is_allowed_topic(msg) -> bool:
 def _is_private_super_admin(chat, uid) -> bool:
     """Check if this is the super admin in a private chat (bypass all group checks)."""
     return chat.type == ChatType.PRIVATE and uid == SUPER_ADMIN_ID
-
-
-def _allowed_topics_text() -> str:
-    if not ALLOWED_TOPIC_IDS:
-        return "全部话题"
-    return ", ".join(sorted(ALLOWED_TOPIC_IDS))
 
 
 def _not_allowed_usage_text() -> str:
@@ -736,8 +705,6 @@ async def _publish_codex_reset_alert(application: Application, item: dict) -> in
     alert_guid = str(item.get("event_key") or item.get("guid") or "")[:256]
     _save_codex_reset_alert(alert_guid, sent.message_id, expires_at, current)
     _mark_codex_event_notified(alert_guid, sent.message_id)
-    if item.get("source") == "rss" and item.get("guid"):
-        _mark_codex_reset_notified(item["guid"], sent.message_id)
     logger.info(
         "Codex reset alert published: source=%s event_key=%s message_id=%s expires_at=%s",
         item.get("source"), item.get("event_key"), sent.message_id, expires_at,
@@ -1093,7 +1060,7 @@ def _inherit_text_model_from_reply(msg) -> Optional[str]:
     if not model_name:
         logger.info("model_inherit: no model line found in replied text")
         return None
-    if model_name in {DS_MODEL, AI_THINKING_MODEL, OAI_MODEL, GEMINI_MODEL, LUNA_MODEL}:
+    if model_name in {DS_MODEL, GEMINI_MODEL, LUNA_MODEL}:
         logger.info("model_inherit: inherited model=%s", model_name)
         return model_name
     logger.info("model_inherit: model line found but not allowed model=%s", model_name)
@@ -1143,28 +1110,6 @@ def _render_quote_text(
     model_block = f"<blockquote>{model_line}</blockquote>"
     budget = TELEGRAM_TEXT_LIMIT - len(model_block) - 1
     return f"{_clip_escaped(safe, budget)}\n{model_block}"
-
-
-def _strip_think_blocks(text: str) -> str:
-    # Remove hidden reasoning blocks like <think>...</think>.
-    # If closing tag hasn't arrived yet, drop content from <think> to the end.
-    out = []
-    i = 0
-    open_tag = "<think>"
-    close_tag = "</think>"
-
-    while i < len(text):
-        start = text.find(open_tag, i)
-        if start == -1:
-            out.append(text[i:])
-            break
-        out.append(text[i:start])
-        end = text.find(close_tag, start + len(open_tag))
-        if end == -1:
-            break
-        i = end + len(close_tag)
-
-    return "".join(out)
 
 
 def _split_visible_and_reasoning(text: str) -> tuple[str, str]:
@@ -1254,7 +1199,6 @@ def _memory_key(update: Update):
     return (chat.id, actor)
 
 
-
 def _trim_history(history):
     keep = max(1, MEMORY_MAX_TURNS) * 2
     return history[-keep:]
@@ -1333,18 +1277,6 @@ def _init_memory_db() -> None:
             """CREATE TABLE IF NOT EXISTS codex_reset_state (
                 state_key TEXT PRIMARY KEY,
                 state_value TEXT NOT NULL
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS codex_reset_items (
-                guid TEXT PRIMARY KEY,
-                title TEXT NOT NULL DEFAULT '',
-                link TEXT NOT NULL DEFAULT '',
-                description TEXT NOT NULL DEFAULT '',
-                pub_date TEXT NOT NULL DEFAULT '',
-                seen_at INTEGER NOT NULL,
-                notified_at INTEGER NOT NULL DEFAULT 0,
-                alert_message_id INTEGER NOT NULL DEFAULT 0
             )"""
         )
         conn.execute(
@@ -1647,33 +1579,6 @@ def _load_managed_pin_text(chat_id: int, topic_id: str) -> str:
     return DEFAULT_DAILY_PIN_TEXT
 
 
-def _codex_reset_is_confirmed(item: dict) -> bool:
-    return (item.get("title") or "").strip().upper().startswith("[RESET CONFIRMED]")
-
-
-def _parse_codex_reset_feed(xml_bytes: bytes) -> list[dict]:
-    """Parse the external RSS feed into bounded dictionaries."""
-    root = ET.fromstring(xml_bytes)
-    channel = root.find("channel")
-    if channel is None:
-        return []
-    items = []
-    for element in channel.findall("item"):
-        guid = (element.findtext("guid") or "").strip()
-        if not guid:
-            continue
-        items.append(
-            {
-                "guid": guid[:256],
-                "title": (element.findtext("title") or "").strip()[:300],
-                "link": (element.findtext("link") or "").strip()[:1000],
-                "description": (element.findtext("description") or "").strip()[:12000],
-                "pub_date": (element.findtext("pubDate") or "").strip()[:128],
-            }
-        )
-    return items
-
-
 def _parse_iso_timestamp(value: str) -> int:
     raw = (value or "").strip()
     if not raw:
@@ -1724,19 +1629,6 @@ def _api_reset_to_item(reset: dict) -> Optional[dict]:
         "source_event_id": event_id,
         "event_key": _codex_event_key(canonical_source, event_at, text),
         "reset_type": str(reset.get("reset_type") or "regular"),
-    }
-
-
-def _rss_reset_to_item(item: dict) -> dict:
-    event_at = _codex_reset_sort_key(item)[0]
-    event_id = item.get("guid") or item.get("link") or ""
-    return {
-        **item,
-        "event_at": event_at,
-        "source": "rss",
-        "source_event_id": str(item.get("guid") or ""),
-        "event_key": _codex_event_key(event_id, event_at, item.get("description") or ""),
-        "reset_type": "regular",
     }
 
 
@@ -1845,11 +1737,6 @@ def _mark_codex_event_notified(event_key: str, message_id: int, now: Optional[in
         conn.close()
 
 
-def _load_latest_rss_confirmed(items: list[dict]) -> Optional[dict]:
-    confirmed = [item for item in items if _codex_reset_is_confirmed(item)]
-    return max(confirmed, key=_codex_reset_sort_key) if confirmed else None
-
-
 async def _fetch_codex_reset_api(*, use_etag: bool = True) -> Optional[dict]:
     headers = {
         "Accept": "application/json",
@@ -1904,95 +1791,6 @@ def _format_reset_command(api_status: Optional[dict]) -> str:
     else:
         lines.append("下次预计重置：暂无")
     return "\n".join(lines)
-
-def _codex_reset_sort_key(item: dict) -> tuple:
-    raw = item.get("pub_date") or ""
-    try:
-        value = parsedate_to_datetime(raw).timestamp()
-    except (TypeError, ValueError, OverflowError):
-        value = 0
-    return (value, item.get("guid") or "")
-
-
-def _prepare_codex_reset_candidates(items: list[dict], now: int) -> list[dict]:
-    """Persist feed state and return only newly confirmed reset items.
-
-    The first successful poll creates a baseline without notifying historical
-    items. An announcement that later changes to RESET CONFIRMED is eligible.
-    """
-    if not items:
-        return []
-    conn = sqlite3.connect(MEMORY_DB_PATH)
-    candidates: list[dict] = []
-    try:
-        initialized = _load_codex_state("feed_initialized") == "1"
-        for item in items:
-            guid = item["guid"]
-            row = conn.execute(
-                "SELECT notified_at FROM codex_reset_items WHERE guid=?", (guid,)
-            ).fetchone()
-            if row is None:
-                baseline_notified = now if not initialized and _codex_reset_is_confirmed(item) else 0
-                conn.execute(
-                    """INSERT INTO codex_reset_items(
-                           guid, title, link, description, pub_date, seen_at, notified_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        guid,
-                        item["title"],
-                        item["link"],
-                        item["description"],
-                        item["pub_date"],
-                        now,
-                        baseline_notified,
-                    ),
-                )
-                if initialized and _codex_reset_is_confirmed(item):
-                    candidates.append(item)
-                continue
-
-            notified_at = int(row[0] or 0)
-            conn.execute(
-                """UPDATE codex_reset_items
-                   SET title=?, link=?, description=?, pub_date=?, seen_at=?
-                   WHERE guid=?""",
-                (
-                    item["title"],
-                    item["link"],
-                    item["description"],
-                    item["pub_date"],
-                    now,
-                    guid,
-                ),
-            )
-            if initialized and _codex_reset_is_confirmed(item) and not notified_at:
-                candidates.append(item)
-
-        if not initialized:
-            conn.execute(
-                """INSERT INTO codex_reset_state(state_key, state_value)
-                   VALUES ('feed_initialized', '1')
-                   ON CONFLICT(state_key) DO UPDATE SET state_value='1'"""
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return sorted(candidates, key=_codex_reset_sort_key)
-
-
-def _mark_codex_reset_notified(guid: str, message_id: int, now: Optional[int] = None) -> None:
-    conn = sqlite3.connect(MEMORY_DB_PATH)
-    try:
-        conn.execute(
-            """UPDATE codex_reset_items
-               SET notified_at=?, alert_message_id=?
-               WHERE guid=?""",
-            (int(now if now is not None else time.time()), int(message_id), guid),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
 
 def _save_codex_reset_alert(guid: str, message_id: int, expires_at: int, previous: Optional[dict]) -> None:
     previous = previous or {}
@@ -2187,13 +1985,6 @@ def _remove_soft_ban_notice(chat_id: int, user_id: int) -> None:
         conn.close()
 
 
-def _clear_soft_ban_notice_memory(chat_id: int, user_id: int) -> None:
-    """清理 DB 与进程内冷却状态。"""
-    _remove_soft_ban_notice(chat_id, user_id)
-    _SOFT_BAN_LAST_NOTICE.pop(f"{chat_id}:{user_id}", None)
-    _SOFT_BAN_NOTICE_DELETE_TASKS.pop(f"{chat_id}:{user_id}", None)
-
-
 def _load_expired_bans() -> list[tuple[int, int, str, int, int]]:
     """返回已到期的 soft ban 记录（不含永久 until_date=0）。
 
@@ -2279,8 +2070,6 @@ def _clear_all_bans_in_chat(chat_id: int) -> list[tuple[int, int, str, int, int,
     return active
 
 
-
-
 def _extract_explicit_result_count(prompt: str) -> Optional[int]:
     t = (prompt or "").strip()
     if not t:
@@ -2294,7 +2083,6 @@ def _extract_explicit_result_count(prompt: str) -> Optional[int]:
         n = int(m.group(1))
         return max(1, min(50, n))
     return None
-
 
 
 def _should_web_search(prompt: str) -> bool:
@@ -2708,28 +2496,12 @@ async def _ask_ai_once(messages, model_name: str, temperature: float = 0.2) -> s
     return str(content)
 
 
-IMAGE_PROMPT_EXPAND_SYSTEM = (
-    "你是文生图提示词工程师。把用户的一句画图需求扩写成一段详尽的英文提示词："
-    "明确画面主体、场景、构图、风格、光线、色调和画面中需要出现的文字内容（文字必须用引号显式标出原文）"
-    "需要中文文字时原样保留中文。只输出扩写后的提示词本身，不要任何解释、前缀或引号包裹。"
-)
-
 IMAGE_EDIT_PROMPT_EXPAND_SYSTEM = (
     "你是图像编辑指令工程师。用户会给出对一张已有图片的修改要求。"
     "把这句要求扩写成一段清晰详尽的编辑指令：明确要改动的区域或对象、改动后的具体样子"
     "（颜色、物体、文字等，文字必须用引号显式标出原文，中文原样保留），"
     "并强调图中未提及的部分保持原样。只输出扩写后的指令本身，不要任何解释、前缀或引号包裹。"
 )
-
-
-async def _expand_image_prompt(prompt: str) -> str:
-    """用 gpt-5.6-luna 把用户的简短画图需求扩写成详细提示词。
-
-    失败时静默回退原始 prompt，不阻塞画图。
-    """
-    return await _expand_prompt_with_luna(
-        prompt, IMAGE_PROMPT_EXPAND_SYSTEM, "image prompt expanded"
-    )
 
 
 async def _expand_image_edit_prompt(prompt: str) -> str:
@@ -2800,7 +2572,6 @@ async def _generate_image(prompt: str, model: str = IMAGE_MODEL) -> bytes:
     base = AI_BASE_URL.rstrip("/")
     headers = {"Authorization": f"Bearer {AI_API_KEY}"}
     payload = {"model": model, "prompt": prompt, "n": 1, "size": "1024x1024"}
-    last_exc = None
     for attempt in range(IMAGE_GEN_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
@@ -2809,7 +2580,6 @@ async def _generate_image(prompt: str, model: str = IMAGE_MODEL) -> bytes:
                     raise RuntimeError(f"Image HTTP {resp.status_code}: {resp.text[:500]}")
                 return _extract_image_bytes(resp.json())
         except Exception as e:
-            last_exc = e
             if attempt < IMAGE_GEN_RETRIES:
                 logger.warning(
                     "image gen attempt %s/%s failed (%s), retrying in %ss...",
@@ -2851,7 +2621,6 @@ async def _post_image_edits(prompt: str, image_bytes: bytes, *, model: str, log_
         "prompt": prompt,
         "response_format": "b64_json",
     }
-    last_exc = None
     for attempt in range(IMAGE_GEN_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
@@ -2860,7 +2629,6 @@ async def _post_image_edits(prompt: str, image_bytes: bytes, *, model: str, log_
                     raise RuntimeError(f"{log_tag} HTTP {resp.status_code}: {resp.text[:500]}")
                 return _extract_image_bytes(resp.json())
         except Exception as e:
-            last_exc = e
             if attempt < IMAGE_GEN_RETRIES:
                 logger.warning(
                     "%s attempt %s/%s failed (%s), retrying in %ss...",
@@ -3510,32 +3278,6 @@ async def _lookup_javdb_actor(query: str) -> tuple[str, str]:
     if found is None:
         raise ActorNotFoundError(f"没有找到演员「{query}」")
     return found
-
-
-async def _lookup_javdb_actor_codes(actor_path: str, limit: int) -> list[str]:
-    """Fetch a JavDB actor page and return its recent DVD IDs."""
-    headers = {
-        "User-Agent": JAVDB_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-    }
-    url = "https://javdb.com" + actor_path
-    timeout = httpx.Timeout(JAVDB_TIMEOUT, connect=8.0)
-    try:
-        async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=False, trust_env=False
-        ) as client:
-            response = await client.get(url, headers=headers)
-    except (httpx.TimeoutException, httpx.NetworkError) as exc:
-        raise ActorSearchError("JavDB 暂时无法访问") from exc
-    if response.status_code >= 400:
-        raise ActorSearchError(f"JavDB HTTP {response.status_code}")
-    if len(response.content) > JAVDB_MAX_HTML_BYTES:
-        raise ActorSearchError("JavDB 响应过大")
-    codes = _parse_javdb_actor_codes(response.text, limit)
-    if not codes:
-        raise ActorNotFoundError("JavDB 演员页没有可用的作品")
-    return codes
 
 
 async def _lookup_javdb_actor_profile(
@@ -4222,13 +3964,13 @@ def _render_status_image(data: dict, query: str = "") -> bytes | None:
                 draw_col_headers(y + 6)
             y += 34
         elif r[0] == "target":
-            tname, tup, paused = r[1], r[2], r[3]
+            tname, _, paused = r[1], r[2], r[3]
             tname = ("⏸ " if paused else "") + tname
             d.text((PAD, y + 4), tname, font=font(26, True), fill=c["txt"])
             draw_col_headers(y + 10)
             y += ROW_H
         else:
-            status, mname, up, latest, cnt, tgt, paused = r[1], r[2], r[3], r[4], r[5], r[6], r[7]
+            status, mname, up, latest, _, tgt, paused = r[1], r[2], r[3], r[4], r[5], r[6], r[7]
             cy = y + ROW_H // 2
             d.ellipse([PAD + 2, cy - 7, PAD + 16, cy + 7],
                       fill=_status_icon_color(status))
@@ -5380,7 +5122,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     answer_text = full_text
-    logger.info("text_raw_full_text: len=%s repr=%s", len(answer_text), repr(answer_text[:200]))
     final_visible_source, _inline_reasoning = _split_visible_and_reasoning(answer_text)
     final_visible = _format_visible_text(final_visible_source).strip()
     final_text = final_visible or "我暂时没有生成到有效内容，请再试一次。"
@@ -6067,6 +5808,7 @@ async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """停止自己正在思考中的 AI 会话。"""
+    global _ACTIVE_DS
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat or not msg.from_user:
@@ -6093,6 +5835,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def force_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """强制终止所有正在进行的 AI 思考会话（超管命令）。"""
+    global _ACTIVE_DS
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
