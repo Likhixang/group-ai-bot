@@ -300,9 +300,28 @@ async def _edit_message_text_retry(
             )
             return
         except BadRequest as e:
-            if "Message is not modified" in str(e):
+            msg_text = str(e)
+            if "Message is not modified" in msg_text:
+                return
+            if "too long" in msg_text.lower():
+                logger.warning("edit_message_text rejected: message too long, skipping update")
                 return
             raise
+        except RetryAfter as e:
+            # 流式编辑过于频繁会触发 flood control；等待后重试，最后一次则跳过本帧，
+            # 而不是把异常抛给调用方导致整个会话被取消。
+            wait = min(float(getattr(e, "retry_after", 1) or 1), 30.0)
+            if i < attempts - 1:
+                logger.warning(
+                    "edit_message_text flood control, waiting %ss (%s/%s)",
+                    wait,
+                    i + 1,
+                    attempts,
+                )
+                await asyncio.sleep(wait)
+                continue
+            logger.warning("edit_message_text flood control, skipping this frame: %s", e)
+            return
         except Exception as e:
             if i < attempts - 1 and _is_timeout_error(e):
                 logger.warning(
@@ -1100,22 +1119,35 @@ def _select_text_model(raw_text: str, msg=None) -> str:
     return DS_MODEL
 
 
+TELEGRAM_TEXT_LIMIT = 4000  # Telegram 单条消息上限 4096，留余量
+TELEGRAM_ELLIPSIS = "…"
+
+
+def _clip_escaped(text: str, budget: int) -> str:
+    """把已转义的 HTML 文本裁剪到 budget 以内，避免截断 HTML 实体或标签。"""
+    if budget <= 0:
+        return ""
+    if len(text) <= budget:
+        return text
+    cut = text[: max(budget - len(TELEGRAM_ELLIPSIS), 0)]
+    # 不要在 &amp; / &#123; 这类实体中间截断
+    tail = re.search(r"&[a-zA-Z#0-9]{0,6}$", cut)
+    if tail:
+        cut = cut[: tail.start()]
+    return cut.rstrip() + TELEGRAM_ELLIPSIS
+
+
 def _render_quote_text(
     raw_text: str,
     model_name: Optional[str] = None,
-    reasoning: Optional[str] = None,
 ) -> str:
     safe = escape((raw_text or "").strip())
     if not safe:
         safe = "..."
     model_line = f"模型: {escape(model_name or DS_MODEL)}"
-    parts = []
-    if reasoning:
-        r = escape(reasoning.strip())
-        parts.append(f"<blockquote expandable>🤔 {r}</blockquote>")
-    parts.append(safe)
-    parts.append(f"<blockquote>{model_line}</blockquote>")
-    return "\n".join(parts)
+    model_block = f"<blockquote>{model_line}</blockquote>"
+    budget = TELEGRAM_TEXT_LIMIT - len(model_block) - 1
+    return f"{_clip_escaped(safe, budget)}\n{model_block}"
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -5226,7 +5258,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         disable_web_page_preview=True,
     )
     full_text = ""
-    reasoning_text = ""
+    reasoning_len = 0  # 仅统计长度用于日志，思考内容不再展示
     last_push = 0.0
     key = _memory_key(update)
 
@@ -5290,28 +5322,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 AI_STREAM_TIMEOUT_RETRIES,
             )
             full_text = ""
-            reasoning_text = ""
+            reasoning_len = 0
             last_push = 0.0
             await asyncio.sleep(0.5)
         try:
             async for kind, piece in _ask_ai_stream(messages, text_model):
                 if kind == "reasoning":
-                    reasoning_text += piece
-                    display = _render_quote_text(
-                        "思考中...",
-                        text_model,
-                        reasoning=reasoning_text[:2000],
-                    )
-                else:
-                    full_text += piece
-                    visible_source, inline_reasoning = _split_visible_and_reasoning(full_text)
-                    merged_reasoning = reasoning_text + inline_reasoning
-                    visible_text = _format_visible_text(visible_source)
-                    display = _render_quote_text(
-                        visible_text[:3800],
-                        text_model,
-                        reasoning=merged_reasoning[:2000] if merged_reasoning else None,
-                    )
+                    reasoning_len += len(piece)
+                    continue
+
+                full_text += piece
+                visible_source, _inline_reasoning = _split_visible_and_reasoning(full_text)
+                visible_text = _format_visible_text(visible_source)
+                display = _render_quote_text(
+                    visible_text[:3800],
+                    text_model,
+                )
 
                 now = time.time()
                 if now - last_push >= 0.8:
@@ -5363,25 +5389,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     answer_text = full_text
     logger.info("text_raw_full_text: len=%s repr=%s", len(answer_text), repr(answer_text[:200]))
-    final_visible_source, inline_reasoning = _split_visible_and_reasoning(answer_text)
-    final_reasoning = reasoning_text + inline_reasoning
+    final_visible_source, _inline_reasoning = _split_visible_and_reasoning(answer_text)
     final_visible = _format_visible_text(final_visible_source).strip()
-    final_text = (final_visible or "我暂时没有生成到有效内容，请再试一次。")[:3800]
+    final_text = final_visible or "我暂时没有生成到有效内容，请再试一次。"
     logger.info(
         "text_response_complete: model=%s content_len=%s reasoning_len=%s",
         text_model,
         len(final_text),
-        len(final_reasoning),
+        reasoning_len,
     )
     await _edit_message_text_retry(
         context,
         chat_id=reply.chat_id,
         message_id=reply.message_id,
-        text=_render_quote_text(
-            final_text,
-            text_model,
-            reasoning=final_reasoning[:2000] if final_reasoning else None,
-        ),
+        text=_render_quote_text(final_text, text_model),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -5391,7 +5412,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         updated = [
             *fresh_history,
             {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": final_text},
+            {"role": "assistant", "content": final_text[:3800]},
         ]
         _save_memory(key, updated)
 
