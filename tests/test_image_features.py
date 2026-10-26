@@ -21,6 +21,8 @@ bot = importlib.import_module("bot")
 def test_clean_image_prompt_removes_img_and_edit_prefixes():
     assert bot._clean_image_prompt("img 画一只猫") == "画一只猫"
     assert bot._clean_image_prompt("/img 画一只猫") == "画一只猫"
+    assert bot._clean_image_prompt("qimg 画一只猫") == "画一只猫"
+    assert bot._clean_image_prompt("/qimg 画一只猫") == "画一只猫"
     assert bot._clean_image_prompt("edit 改成夜景") == "改成夜景"
     assert bot._clean_image_prompt("/edit 改成夜景") == "改成夜景"
 
@@ -69,6 +71,11 @@ def test_clean_prompt_and_select_text_model_for_lm():
 def test_image_request_detection_handles_prefixes_and_commands():
     assert bot._is_image_generation_request("img 赛博朋克城市") is True
     assert bot._is_image_generation_request("/img 赛博朋克城市") is True
+    assert bot._is_image_generation_request("qimg 赛博朋克城市") is True
+    assert bot._is_image_generation_request("/qimg 赛博朋克城市") is True
+    assert bot._is_qwen_image_generation_request("qimg 赛博朋克城市") is True
+    assert bot._is_qwen_image_generation_request("/qimg 赛博朋克城市") is True
+    assert bot._is_qwen_image_generation_request("img 赛博朋克城市") is False
     assert bot._is_image_generation_request("ds img 赛博朋克城市") is False
     assert bot._is_image_edit_request("edit 改成水彩") is True
     assert bot._is_image_edit_request("/edit 改成水彩") is True
@@ -765,3 +772,117 @@ def test_av_actor_lookup_pipeline_accepts_english_name_without_javdb(monkeypatch
     assert movies[0]["actor_display"] == "Tsukasa Aoi"
     assert movies[0]["actor_romaji"] == "Tsukasa Aoi"
     assert calls == ["Tsukasa Aoi", "tsukasa-aoi"]
+
+
+def test_img_command_uses_raw_prompt_without_luna_expansion(monkeypatch):
+    seen = []
+
+    async def fail_expand(prompt):
+        raise AssertionError("/img must not expand the user prompt with luna")
+
+    async def fake_find_reference(prompt):
+        return None
+
+    async def fake_generate(prompt, model=bot.IMAGE_MODEL):
+        seen.append((prompt, model))
+        return b"image-bytes"
+
+    async def fake_reply_text(msg, text, **kwargs):
+        return SimpleNamespace(chat_id=-100123, message_id=101)
+
+    async def fake_reply_photo(*, photo, caption, parse_mode):
+        assert photo.read() == b"image-bytes"
+        assert "画一只猫" in caption
+        assert bot.IMAGE_MODEL in caption
+
+    async def fake_delete_message(**kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_expand_image_prompt", fail_expand)
+    monkeypatch.setattr(bot, "_find_reference_image", fake_find_reference)
+    monkeypatch.setattr(bot, "_generate_image", fake_generate)
+    monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
+    monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
+
+    msg = SimpleNamespace(
+        text="/img 画一只猫",
+        caption=None,
+        message_id=100,
+        from_user=SimpleNamespace(id=1),
+        reply_to_message=None,
+        photo=None,
+        document=None,
+        reply_photo=fake_reply_photo,
+    )
+    chat = SimpleNamespace(id=-100123, type=bot.ChatType.SUPERGROUP)
+    context = SimpleNamespace(
+        user_data={},
+        bot=SimpleNamespace(delete_message=fake_delete_message),
+    )
+
+    asyncio.run(
+        bot.on_image_request(
+            SimpleNamespace(effective_message=msg, effective_chat=chat),
+            context,
+        )
+    )
+
+    assert seen == [("画一只猫", bot.IMAGE_MODEL)]
+
+
+def test_qimg_command_calls_qwen_image_with_raw_prompt(monkeypatch):
+    seen = []
+
+    async def fail_expand(prompt):
+        raise AssertionError("/qimg must not expand the user prompt with luna")
+
+    async def fail_reference(prompt):
+        raise AssertionError("/qimg must not search for reference images")
+
+    async def fake_generate(prompt, model=bot.QWEN_IMAGE_MODEL):
+        seen.append((prompt, model))
+        return b"qwen-image-bytes"
+
+    async def fake_reply_text(msg, text, **kwargs):
+        return SimpleNamespace(chat_id=-100123, message_id=101)
+
+    async def fake_reply_photo(*, photo, caption, parse_mode):
+        assert photo.read() == b"qwen-image-bytes"
+        assert "赛博朋克猫" in caption
+        assert "qwen-image" in caption
+
+    async def fake_delete_message(**kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "_expand_image_prompt", fail_expand)
+    monkeypatch.setattr(bot, "_find_reference_image", fail_reference)
+    monkeypatch.setattr(bot, "_generate_image", fake_generate)
+    monkeypatch.setattr(bot, "_reply_text_and_track", fake_reply_text)
+    monkeypatch.setattr(bot, "_is_allowed_chat", lambda chat: True)
+    monkeypatch.setattr(bot, "_is_allowed_topic", lambda msg: True)
+
+    msg = SimpleNamespace(
+        text="/qimg 赛博朋克猫",
+        caption=None,
+        message_id=100,
+        from_user=SimpleNamespace(id=1),
+        reply_to_message=None,
+        photo=None,
+        document=None,
+        reply_photo=fake_reply_photo,
+    )
+    chat = SimpleNamespace(id=-100123, type=bot.ChatType.SUPERGROUP)
+    context = SimpleNamespace(
+        user_data={},
+        bot=SimpleNamespace(delete_message=fake_delete_message),
+    )
+
+    asyncio.run(
+        bot.on_image_request(
+            SimpleNamespace(effective_message=msg, effective_chat=chat),
+            context,
+        )
+    )
+
+    assert seen == [("赛博朋克猫", bot.QWEN_IMAGE_MODEL)]

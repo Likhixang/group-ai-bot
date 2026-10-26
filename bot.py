@@ -69,6 +69,7 @@ LUNA_MODEL = os.getenv("LUNA_MODEL", "gpt-6-luna").strip()
 LUMO_MODEL = os.getenv("LUMO_MODEL", "lumo-2.0-max").strip()
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-2").strip()
 IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", IMAGE_MODEL).strip()
+QWEN_IMAGE_MODEL = os.getenv("QWEN_IMAGE_MODEL", "qwen-image").strip()
 # --- 图片生成 (AxonHub /v1/images/generations，OpenAI 兼容) ---
 # 文生图：POST {AI_BASE_URL}/images/generations
 # 图生图：同端点，附 image 字段（base64）
@@ -883,7 +884,11 @@ def _image_request_command(raw_text: str) -> str:
 
 
 def _is_image_generation_request(raw_text: str) -> bool:
-    return _image_request_command(raw_text) == "img"
+    return _image_request_command(raw_text) in {"img", "qimg"}
+
+
+def _is_qwen_image_generation_request(raw_text: str) -> bool:
+    return _image_request_command(raw_text) == "qimg"
 
 
 def _is_image_edit_request(raw_text: str) -> bool:
@@ -893,7 +898,7 @@ def _is_image_edit_request(raw_text: str) -> bool:
 
 def _clean_image_prompt(raw_text: str) -> str:
     text = (raw_text or "").strip()
-    if _image_request_command(text) in {"img", "edit"}:
+    if _image_request_command(text) in {"img", "qimg", "edit"}:
         return text.partition(" ")[2].strip()
     return text.strip()
 
@@ -3840,7 +3845,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
     await _reply_text_and_track(
         msg,
-        "已上线。发送：ds / gm + 空格 + 问题；img + 提示词生成图片；回复图片用 edit + 要求改图；/av 番号查封面，回复图片发 /av 或图片 caption 写 /av 可检索番号。"
+        "已上线。发送：ds / gm + 空格 + 问题；img / qimg + 提示词生成图片；回复图片用 edit + 要求改图；/av 番号查封面，回复图片发 /av 或图片 caption 写 /av 可检索番号。"
     )
 
 
@@ -3865,6 +3870,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"/lm 或 lm 你的问题 — 对话 ({LUMO_MODEL})\n"
             f"/ln 或 ln 你的问题 — 对话 ({LUNA_MODEL})\n"
             "/img 或 img 提示词 — 生成图片\n"
+            "/qimg 或 qimg 提示词 — Qwen生成图片\n"
             "/edit 或 edit 要求 — 回复图片改图（或上传图+写 caption）\n"
             "/av 番号 — 查询封面（Fourhoi → R18.dev）；回复图片发 /av，或图片 caption 写 /av 检索番号（AVScan）\n"
             "直接回复文字继续聊 | 回复图片则改图\n"
@@ -5004,6 +5010,7 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     override_text = context.user_data.pop("_image_prefix_text", None) if context.user_data is not None else None
     raw_text = override_text or _message_prompt_text(msg)
     is_generation = _is_image_generation_request(raw_text)
+    is_qwen_generation = _is_qwen_image_generation_request(raw_text)
     is_edit = _is_image_edit_request(raw_text)
     reply_image_file_id = _reply_image_target(msg)
     if is_edit and not reply_image_file_id:
@@ -5063,12 +5070,15 @@ async def on_image_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             final_prompt = await _expand_image_edit_prompt(image_prompt)
             image_bytes = await _edit_image(final_prompt, source_bytes)
             model_name = IMAGE_EDIT_MODEL
+        elif is_qwen_generation:
+            # /qimg 命令：直接使用用户提示词，调用 qwen-image
+            final_prompt = image_prompt
+            image_bytes = await _generate_image(final_prompt, model=QWEN_IMAGE_MODEL)
+            model_name = QWEN_IMAGE_MODEL
         else:
-            # 提示词扩写与参考图并行准备；参考图缺失时回退纯文本生成。
-            final_prompt, reference_bytes = await asyncio.gather(
-                _expand_image_prompt(image_prompt),
-                _find_reference_image(image_prompt),
-            )
+            # /img 命令：直接使用用户提示词（不经过 luna 改写）
+            final_prompt = image_prompt
+            reference_bytes = await _find_reference_image(image_prompt)
             if reference_bytes:
                 logger.info(
                     "image_reference_used: prompt=%r bytes=%s",
@@ -6872,6 +6882,7 @@ async def post_init(application: Application) -> None:
         BotCommand("lm", f"对话 ({LUMO_MODEL})"),
         BotCommand("ln", f"对话 ({LUNA_MODEL})"),
         BotCommand("img", "生成图片"),
+        BotCommand("qimg", "Qwen生成图片"),
         BotCommand("edit", "修改图片"),
         BotCommand("av", "番号查 R18.dev 封面；图片检索 AVScan"),
         BotCommand("help", "查看帮助"),
@@ -6953,7 +6964,7 @@ def main() -> None:
     app.add_handler(CommandHandler("force_stop", force_stop_cmd))
     app.add_handler(CommandHandler("pin", pin_cmd))
     app.add_handler(CommandHandler("unpin", unpin_cmd))
-    app.add_handler(CommandHandler(["img", "edit"], image_cmd))
+    app.add_handler(CommandHandler(["img", "qimg", "edit"], image_cmd))
     app.add_handler(CommandHandler("av", av_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("allow", allow_cmd))
