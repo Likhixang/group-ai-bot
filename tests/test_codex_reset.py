@@ -108,9 +108,8 @@ def test_reset_command_uses_api_schedule_and_twitter_link(reset_db):
         }
     }
     text = bot._format_reset_command(status)
-    assert "上次重置：2026-09-12 16:09" in text
-    assert "<code>regular</code>（普通重置，额度直接刷新）" in text
-    assert "下次预计重置：2026-09-23 15:00" in text
+    assert "上次重置：2026-09-12 16:09 (regular)" in text
+    assert "下次预计重置：2026-09-23 15:00 (regular)" in text
     assert "https://x.com/thsottiaux/status/2222222222" in text
 
 
@@ -142,8 +141,8 @@ def test_reset_command_distinguishes_banked_and_regular(reset_db):
         }
     }
     text = bot._format_reset_command(status)
-    assert "上次重置：2026-11-01 08:43 · <code>banked</code>（存入账户，需手动兑换）" in text
-    assert "下次预计重置：2026-11-02 15:00 · <code>regular</code>（普通重置，额度直接刷新）" in text
+    assert "上次重置：2026-11-01 08:43 (banked)" in text
+    assert "下次预计重置：2026-11-02 15:00 (regular)" in text
 
 
 def test_alert_formatting_distinguishes_regular_and_banked():
@@ -161,12 +160,12 @@ def test_alert_formatting_distinguishes_regular_and_banked():
             "link": "https://x.com/thsottiaux/status/2116692529970311254",
         }
     )
-    assert "Codex Regular 重置已确认" in regular
-    assert "类型：<code>regular</code>（普通重置，当前周期额度已直接刷新）" in regular
-    assert "banked" not in regular
-    assert "Codex Banked 重置已发放" in banked
-    assert "类型：<code>banked</code>（存入账户，需手动兑换，不会直接刷新当前额度）" in banked
-    assert "regular" not in banked
+    assert regular.splitlines()[0] == "🚨 <b>Codex Regular 重置已确认</b>"
+    assert "类型：" not in regular
+    assert "Banked" not in regular
+    assert banked.splitlines()[0] == "🚨 <b>Codex Banked 重置已发放</b>"
+    assert "类型：" not in banked
+    assert "Regular" not in banked
 
 
 def test_observation_persists_reset_type(reset_db):

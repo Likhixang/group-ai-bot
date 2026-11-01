@@ -635,7 +635,7 @@ async def _translate_codex_reset_text(text: str) -> str:
             "content": (
                 "你是专业技术信息翻译器。将用户提供的英文公告翻译成自然、准确的简体中文。"
                 "只输出译文，不要解释、摘要、前缀或引号。保留 URL、数字、产品名、模型名、"
-                "API、banked reset、Banked 和专有名词；不要翻译 URL。"
+                "API 和专有名词；不要翻译 URL。"
             ),
         },
         {"role": "user", "content": original},
@@ -1620,11 +1620,7 @@ def _format_codex_reset_type_tag(reset_type: object, *, default: str = "regular"
     kind = _normalize_codex_reset_type(reset_type, default=default)
     if not kind:
         return ""
-    if kind == "banked":
-        return "<code>banked</code>（存入账户，需手动兑换）"
-    if kind == "regular":
-        return "<code>regular</code>（普通重置，额度直接刷新）"
-    return f"<code>{escape(kind)}</code>"
+    return f"({escape(kind)})"
 
 
 def _api_reset_to_item(reset: dict) -> Optional[dict]:
@@ -1807,7 +1803,7 @@ def _format_reset_command(api_status: Optional[dict]) -> str:
     if latest:
         latest_type_tag = _format_codex_reset_type_tag(latest.get("reset_type"))
         lines.append(
-            f"上次重置：{_format_local_datetime(latest['event_at'])} · {latest_type_tag}"
+            f"上次重置：{_format_local_datetime(latest['event_at'])} {latest_type_tag}"
         )
     else:
         lines.append("上次重置：暂无记录")
@@ -1816,7 +1812,7 @@ def _format_reset_command(api_status: Optional[dict]) -> str:
     if scheduled_for:
         scheduled_line = f"下次预计重置：{_format_local_datetime(scheduled_for)}"
         if scheduled_type_tag:
-            scheduled_line = f"{scheduled_line} · {scheduled_type_tag}"
+            scheduled_line = f"{scheduled_line} {scheduled_type_tag}"
         lines.append(scheduled_line)
         if scheduled_link:
             lines.append(f'🔗 <a href="{escape(scheduled_link, quote=True)}">相关 Twitter</a>')
@@ -1915,14 +1911,11 @@ def _format_codex_reset_alert(item: dict) -> str:
     reset_type = _normalize_codex_reset_type(item.get("reset_type"))
     if reset_type == "banked":
         header = "🚨 <b>Codex Banked 重置已发放</b>"
-        type_line = "类型：<code>banked</code>（存入账户，需手动兑换，不会直接刷新当前额度）"
     elif reset_type == "regular":
         header = "🚨 <b>Codex Regular 重置已确认</b>"
-        type_line = "类型：<code>regular</code>（普通重置，当前周期额度已直接刷新）"
     else:
-        header = f"🚨 <b>Codex 重置已确认（{escape(reset_type)}）</b>"
-        type_line = f"类型：<code>{escape(reset_type)}</code>"
-    lines = [header, type_line]
+        header = f"🚨 <b>Codex {escape(reset_type)} 重置已确认</b>"
+    lines = [header]
     if description:
         lines.extend(["", escape(description)])
     link = item.get("link") or ""
