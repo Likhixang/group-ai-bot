@@ -635,7 +635,7 @@ async def _translate_codex_reset_text(text: str) -> str:
             "content": (
                 "你是专业技术信息翻译器。将用户提供的英文公告翻译成自然、准确的简体中文。"
                 "只输出译文，不要解释、摘要、前缀或引号。保留 URL、数字、产品名、模型名、"
-                "API 和专有名词；不要翻译 URL。"
+                "API、banked reset、Banked 和专有名词；不要翻译 URL。"
             ),
         },
         {"role": "user", "content": original},
@@ -706,8 +706,8 @@ async def _publish_codex_reset_alert(application: Application, item: dict) -> in
     _save_codex_reset_alert(alert_guid, sent.message_id, expires_at, current)
     _mark_codex_event_notified(alert_guid, sent.message_id)
     logger.info(
-        "Codex reset alert published: source=%s event_key=%s message_id=%s expires_at=%s",
-        item.get("source"), item.get("event_key"), sent.message_id, expires_at,
+        "Codex reset alert published: source=%s reset_type=%s event_key=%s message_id=%s expires_at=%s",
+        item.get("source"), item.get("reset_type"), item.get("event_key"), sent.message_id, expires_at,
     )
     return int(sent.message_id)
 
@@ -1255,11 +1255,13 @@ def _init_memory_db() -> None:
                 suppressed_at INTEGER NOT NULL DEFAULT 0,
                 correlated_event_key TEXT NOT NULL DEFAULT '',
                 baseline INTEGER NOT NULL DEFAULT 0,
+                reset_type TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (source, source_event_id)
             )"""
         )
         for col_sql in (
             "ALTER TABLE codex_reset_observations ADD COLUMN baseline INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE codex_reset_observations ADD COLUMN reset_type TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 conn.execute(col_sql)
@@ -1609,6 +1611,22 @@ def _codex_event_key(event_id: str, event_at: int, text: str) -> str:
     return f"text:{digest}"
 
 
+def _normalize_codex_reset_type(value: object, *, default: str = "regular") -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized or default
+
+
+def _format_codex_reset_type_tag(reset_type: object, *, default: str = "regular") -> str:
+    kind = _normalize_codex_reset_type(reset_type, default=default)
+    if not kind:
+        return ""
+    if kind == "banked":
+        return "<code>banked</code>（存入账户，需手动兑换）"
+    if kind == "regular":
+        return "<code>regular</code>（普通重置，额度直接刷新）"
+    return f"<code>{escape(kind)}</code>"
+
+
 def _api_reset_to_item(reset: dict) -> Optional[dict]:
     if not isinstance(reset, dict) or not reset.get("id"):
         return None
@@ -1618,9 +1636,10 @@ def _api_reset_to_item(reset: dict) -> Optional[dict]:
     text = str(reset.get("text") or "").strip()
     event_id = str(reset["id"])
     canonical_source = str(link or event_id)
+    reset_type = _normalize_codex_reset_type(reset.get("reset_type"))
     return {
         "guid": event_id,
-        "title": "[RESET CONFIRMED] Codex Resets API",
+        "title": f"[RESET CONFIRMED:{reset_type.upper()}] Codex Resets API",
         "link": link,
         "description": text,
         "pub_date": str(reset.get("announced_at") or ""),
@@ -1628,7 +1647,7 @@ def _api_reset_to_item(reset: dict) -> Optional[dict]:
         "source": "api",
         "source_event_id": event_id,
         "event_key": _codex_event_key(canonical_source, event_at, text),
-        "reset_type": str(reset.get("reset_type") or "regular"),
+        "reset_type": reset_type,
     }
 
 
@@ -1681,17 +1700,18 @@ def _record_codex_observation(item: dict, now: int, baseline: bool = False) -> b
             return not baseline and not int(existing[0] or 0)
 
         notified_at = now if baseline else 0
+        reset_type = _normalize_codex_reset_type(item.get("reset_type"))
         conn.execute(
             """INSERT INTO codex_reset_observations(
                    source, source_event_id, event_key, event_at, title, text, link,
-                   first_seen_at, notified_at, suppressed_at, correlated_event_key
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '')""",
+                   first_seen_at, notified_at, suppressed_at, correlated_event_key, reset_type
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', ?)""",
             (
                 source, source_event_id, event_key, event_at,
                 str(item.get("title") or "")[:300],
                 str(item.get("description") or "")[:12000],
                 str(item.get("link") or "")[:1000],
-                now, notified_at,
+                now, notified_at, reset_type,
             ),
         )
         conn.commit()
@@ -1779,13 +1799,25 @@ def _format_reset_command(api_status: Optional[dict]) -> str:
     scheduled = data.get("scheduled_reset") or {}
     scheduled_for = _parse_iso_timestamp(str(scheduled.get("scheduled_for") or ""))
     scheduled_link = ((scheduled.get("source") or {}).get("url") or "")
+    scheduled_type_tag = _format_codex_reset_type_tag(
+        scheduled.get("reset_type"), default=""
+    )
 
     lines = ["🔄 <b>Codex Reset 状态</b>", ""]
-    lines.append(f"上次重置：{_format_local_datetime(latest['event_at']) if latest else '暂无记录'}")
+    if latest:
+        latest_type_tag = _format_codex_reset_type_tag(latest.get("reset_type"))
+        lines.append(
+            f"上次重置：{_format_local_datetime(latest['event_at'])} · {latest_type_tag}"
+        )
+    else:
+        lines.append("上次重置：暂无记录")
     if latest and latest.get("link"):
         lines.append(f'🔗 <a href="{escape(latest["link"], quote=True)}">上次重置原文</a>')
     if scheduled_for:
-        lines.append(f"下次预计重置：{_format_local_datetime(scheduled_for)}")
+        scheduled_line = f"下次预计重置：{_format_local_datetime(scheduled_for)}"
+        if scheduled_type_tag:
+            scheduled_line = f"{scheduled_line} · {scheduled_type_tag}"
+        lines.append(scheduled_line)
         if scheduled_link:
             lines.append(f'🔗 <a href="{escape(scheduled_link, quote=True)}">相关 Twitter</a>')
     else:
@@ -1880,7 +1912,17 @@ def _format_codex_reset_alert(item: dict) -> str:
         flags=re.IGNORECASE,
     )[0].strip()
     description = _strip_codex_body_urls(description)
-    lines = ["🚨 <b>Codex 重置已确认</b>"]
+    reset_type = _normalize_codex_reset_type(item.get("reset_type"))
+    if reset_type == "banked":
+        header = "🚨 <b>Codex Banked 重置已发放</b>"
+        type_line = "类型：<code>banked</code>（存入账户，需手动兑换，不会直接刷新当前额度）"
+    elif reset_type == "regular":
+        header = "🚨 <b>Codex Regular 重置已确认</b>"
+        type_line = "类型：<code>regular</code>（普通重置，当前周期额度已直接刷新）"
+    else:
+        header = f"🚨 <b>Codex 重置已确认（{escape(reset_type)}）</b>"
+        type_line = f"类型：<code>{escape(reset_type)}</code>"
+    lines = [header, type_line]
     if description:
         lines.extend(["", escape(description)])
     link = item.get("link") or ""

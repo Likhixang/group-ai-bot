@@ -109,8 +109,89 @@ def test_reset_command_uses_api_schedule_and_twitter_link(reset_db):
     }
     text = bot._format_reset_command(status)
     assert "上次重置：2026-09-12 16:09" in text
+    assert "<code>regular</code>（普通重置，额度直接刷新）" in text
     assert "下次预计重置：2026-09-23 15:00" in text
     assert "https://x.com/thsottiaux/status/2222222222" in text
+
+
+def test_reset_command_distinguishes_banked_and_regular(reset_db):
+    status = {
+        "data": {
+            "latest_reset": {
+                "id": "2116692529970311254",
+                "reset_type": "banked",
+                "announced_at": "2026-11-01T00:43:20Z",
+                "text": "Banked 1/2",
+                "source": {
+                    "type": "x_post",
+                    "url": "https://x.com/thsottiaux/status/2116692529970311254",
+                },
+            },
+            "scheduled_reset": {
+                "id": "3333333333",
+                "status": "scheduled",
+                "reset_type": "regular",
+                "announced_at": "2026-11-01T01:00:00Z",
+                "scheduled_for": "2026-11-02T07:00:00Z",
+                "text": "Regular reset tomorrow.",
+                "source": {
+                    "type": "x_post",
+                    "url": "https://x.com/thsottiaux/status/3333333333",
+                },
+            },
+        }
+    }
+    text = bot._format_reset_command(status)
+    assert "上次重置：2026-11-01 08:43 · <code>banked</code>（存入账户，需手动兑换）" in text
+    assert "下次预计重置：2026-11-02 15:00 · <code>regular</code>（普通重置，额度直接刷新）" in text
+
+
+def test_alert_formatting_distinguishes_regular_and_banked():
+    regular = bot._format_codex_reset_alert(
+        {
+            "reset_type": "regular",
+            "description": "重置已完成。",
+            "link": "https://x.com/thsottiaux/status/1234567890",
+        }
+    )
+    banked = bot._format_codex_reset_alert(
+        {
+            "reset_type": "banked",
+            "description": "Banked 1/2",
+            "link": "https://x.com/thsottiaux/status/2116692529970311254",
+        }
+    )
+    assert "Codex Regular 重置已确认" in regular
+    assert "类型：<code>regular</code>（普通重置，当前周期额度已直接刷新）" in regular
+    assert "banked" not in regular
+    assert "Codex Banked 重置已发放" in banked
+    assert "类型：<code>banked</code>（存入账户，需手动兑换，不会直接刷新当前额度）" in banked
+    assert "regular" not in banked
+
+
+def test_observation_persists_reset_type(reset_db):
+    item = bot._api_reset_to_item(
+        {
+            "id": "2116692529970311254",
+            "reset_type": "banked",
+            "announced_at": "2026-11-01T00:43:20Z",
+            "text": "Banked 1/2",
+            "source": {
+                "type": "x_post",
+                "url": "https://x.com/thsottiaux/status/2116692529970311254",
+            },
+        }
+    )
+    assert bot._record_codex_observation(item, 100, baseline=False) is True
+    conn = bot.sqlite3.connect(str(reset_db))
+    try:
+        row = conn.execute(
+            "SELECT reset_type, title FROM codex_reset_observations WHERE source_event_id=?",
+            ("2116692529970311254",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("banked", "[RESET CONFIRMED:BANKED] Codex Resets API")
 
 
 @pytest.mark.asyncio
